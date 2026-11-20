@@ -14,12 +14,12 @@ interface GodsTabProps {
 }
 
 const RACE_STEPS = [
-  { threshold: 20, label: '20+ للجميع', rewardText: '1,000', corn: 1000, stars: 5 },
-  { threshold: 50, label: '50+ للجميع', rewardText: '2,000', corn: 2000, stars: 10 },
-  { threshold: 100, label: '100+ للجميع', rewardText: '3,000', corn: 3000, stars: 15 },
-  { threshold: 280, label: '280+ (230 مركز)', rewardText: '5,000', corn: 5000, stars: 25 },
-  { threshold: 550, label: '550+ (208 مركز)', rewardText: '7,500', corn: 7500, stars: 40 },
-  { threshold: 1100, label: '1100+ المركز الأول', rewardText: '85,000', corn: 25000, stars: 100 },
+  { threshold: 20, label: '20+ للجميع', rewardText: '250', corn: 250, stars: 3 },
+  { threshold: 50, label: '50+ للجميع', rewardText: '450', corn: 450, stars: 4 },
+  { threshold: 100, label: '100+ للجميع', rewardText: '700', corn: 700, stars: 6 },
+  { threshold: 280, label: '280+ (230 مركز)', rewardText: '1,000', corn: 1000, stars: 8 },
+  { threshold: 550, label: '550+ (208 مركز)', rewardText: '1,300', corn: 1300, stars: 9 },
+  { threshold: 1100, label: '1100+ المركز الأول', rewardText: '1,900', corn: 1900, stars: 12 },
 ];
 
 export const GodsTab: React.FC<GodsTabProps> = ({

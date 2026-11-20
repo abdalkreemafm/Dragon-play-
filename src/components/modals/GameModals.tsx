@@ -1,20 +1,23 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Check,
   Crown,
+  Flame,
   Gift,
+  Hammer,
   Lock,
   LogOut,
   RotateCcw,
   Send,
   Shield,
   Sparkles,
+  TrendingUp,
   Volume2,
   VolumeX,
   Wallet,
   X,
 } from 'lucide-react';
-import { GameState, MainTab } from '../../types/game';
+import { GameState, MainTab, SquadTalentKey } from '../../types/game';
 import { BATTLE_PASS_LEVELS, formatTimer } from '../../data/gameData';
 import {
   CornIcon,
@@ -24,6 +27,19 @@ import {
   StarIcon,
 } from '../art/DuckArt';
 import { soundFX } from '../../utils/sound';
+import {
+  ECONOMY_LIMITS,
+  RELIC_FORGE_CATALOG,
+  RelicForgeOffer,
+  SQUAD_TALENT_CATALOG,
+  getBarterEnergyForGoldCost,
+  getBarterEnergyForStarsCost,
+  getDailyBurnRatio,
+  getEnergySoftCap,
+  getPlayerTier,
+  getSquadTalentCost,
+  getTraderDealStarCost,
+} from '../../utils/economyEngine';
 
 export type ActiveModal =
   | null
@@ -38,6 +54,7 @@ export type ActiveModal =
 
 interface GameModalsProps {
   modal: ActiveModal;
+  packInitialSubTab?: 'CHAT' | 'TALENTS' | 'FORGE';
   state: GameState;
   onClose: () => void;
   onSwitchTab: (tab: MainTab) => void;
@@ -51,6 +68,8 @@ interface GameModalsProps {
   onJoinPack: () => void;
   onContributePack: (amount: number) => void;
   onSendPackMessage: (text: string) => void;
+  onUpgradeSquadTalent: (talentKey: SquadTalentKey) => void;
+  onForgeRelic: (offerId: RelicForgeOffer['id']) => void;
   onToggleWalletConnect: () => void;
   onSwapWallet: (direction: 'CORN_TO_STARS' | 'STARS_TO_GRAM' | 'CORN_TO_GOLD') => void;
   onToggleMute: () => void;
@@ -59,14 +78,15 @@ interface GameModalsProps {
 }
 
 const TOURNAMENT_MILESTONES = [
-  { threshold: 40, label: '30 بيضة', type: 'eggs' as const, amount: 15 },
-  { threshold: 100, label: '50 ميدالية', type: 'medals' as const, amount: 50 },
-  { threshold: 250, label: '40 ذهب 💎', type: 'gold' as const, amount: 40 },
-  { threshold: 400, label: '100 ميدالية', type: 'medals' as const, amount: 100 },
+  { threshold: 40, label: '3 بيضات', type: 'eggs' as const, amount: 3 },
+  { threshold: 100, label: '18 ميدالية', type: 'medals' as const, amount: 18 },
+  { threshold: 250, label: '8 ذهب 💎', type: 'gold' as const, amount: 8 },
+  { threshold: 400, label: '32 ميدالية', type: 'medals' as const, amount: 32 },
 ];
 
 export const GameModals: React.FC<GameModalsProps> = ({
   modal,
+  packInitialSubTab = 'CHAT',
   state,
   onClose,
   onSwitchTab,
@@ -80,6 +100,8 @@ export const GameModals: React.FC<GameModalsProps> = ({
   onJoinPack,
   onContributePack,
   onSendPackMessage,
+  onUpgradeSquadTalent,
+  onForgeRelic,
   onToggleWalletConnect,
   onSwapWallet,
   onToggleMute,
@@ -87,10 +109,28 @@ export const GameModals: React.FC<GameModalsProps> = ({
   onResetGame,
 }) => {
   const [packMsgInput, setPackMsgInput] = useState('');
+  const [packSubTab, setPackSubTab] = useState<'CHAT' | 'TALENTS' | 'FORGE'>(packInitialSubTab);
   const [walletTab, setWalletTab] = useState<'GRAM' | 'DMD' | 'GODS'>('GRAM');
+
+  useEffect(() => {
+    if (modal === 'PACK') {
+      setPackSubTab(packInitialSubTab);
+    }
+  }, [modal, packInitialSubTab]);
 
   if (!modal) return null;
 
+  const playerTier = getPlayerTier(state);
+  const traderStarCost = getTraderDealStarCost(playerTier);
+  const walletStarsCost = getBarterEnergyForStarsCost(playerTier);
+  const walletGoldCost = getBarterEnergyForGoldCost(playerTier);
+  const barterStarsUsed = state.treasury.barterStarsToday ?? 0;
+  const barterGoldUsed = state.treasury.barterGoldToday ?? 0;
+  const softCap = getEnergySoftCap(playerTier);
+  const dailyBurnRatio = getDailyBurnRatio(state.treasury);
+  const talents = state.pack.talents ?? { fury: 0, carapace: 0, incubation: 0, prestige: 0 };
+  const buffs = state.activeBuffs ?? { duelFuryUntil: 0, critEdgeUntil: 0, eggSurgeUntil: 0 };
+  const nowTs = Date.now();
   const currentPassLevel = Math.min(15, Math.floor(state.battlePass.xp / 100) + 1);
   const currentPassProgress = state.battlePass.xp % 100;
 
@@ -224,28 +264,30 @@ export const GameModals: React.FC<GameModalsProps> = ({
               </div>
               <div className="rounded-2xl bg-slate-900 border border-slate-800 p-3 flex flex-col items-center">
                 <ItemIcon item="egg_3" className="w-10 h-10" />
-                <span className="text-[11px] font-bold text-slate-200 mt-1">+8 بيضات</span>
+                <span className="text-[11px] font-bold text-slate-200 mt-1">+4 بيضات</span>
               </div>
             </div>
 
             <div>
               <span className="inline-block mb-1.5 px-2.5 py-0.5 rounded-md bg-rose-500 text-white text-[10px] font-black">
-                وفر 25%
+                تسعير الرتبة {playerTier} · وفر 25%
               </span>
               <button
-                disabled={state.stars < 20}
+                disabled={state.stars < traderStarCost}
                 onClick={() => {
                   soundFX.playChestOpen();
                   onBuyTraderDeal();
                 }}
-                className={`w-full py-3.5 rounded-2xl font-black text-sm flex items-center justify-center gap-2 ${
-                  state.stars >= 20
+                className={`w-full min-h-[48px] py-3.5 rounded-2xl font-black text-sm flex items-center justify-center gap-2 ${
+                  state.stars >= traderStarCost
                     ? 'bg-gradient-to-b from-[#facc15] to-[#eab308] text-slate-950 hover:brightness-105 cursor-pointer'
                     : 'bg-slate-800 text-slate-500 cursor-not-allowed'
                 }`}
               >
                 <StarIcon className="w-5 h-5" />
-                <span className="font-mono-num">20 ★ (بدلاً من 30)</span>
+                <span className="font-mono-num">
+                  {traderStarCost} ★ (بدلاً من {Math.round(traderStarCost * 1.35)})
+                </span>
               </button>
             </div>
           </div>
@@ -321,8 +363,8 @@ export const GameModals: React.FC<GameModalsProps> = ({
               </div>
               <div className="grid grid-cols-2 gap-2 pt-1">
                 {[
-                  { id: 1, title: '10 بيضات تنين', corn: 0, eggs: 10 },
-                  { id: 2, title: '1,500 طاقة ⚡', corn: 1500, eggs: 0 },
+                  { id: 1, title: '2 بيضات تنين', corn: 0, eggs: 2 },
+                  { id: 2, title: '280 طاقة ⚡', corn: 280, eggs: 0 },
                 ].map((rw) => {
                   const claimed = state.claimedDailyLevelRewards.includes(rw.id);
                   return (
@@ -365,7 +407,7 @@ export const GameModals: React.FC<GameModalsProps> = ({
             </div>
             <div className="rounded-2xl bg-slate-900 border border-slate-800 p-3 text-center">
               <ItemIcon item="egg_4" className="w-12 h-12 mx-auto" />
-              <div className="text-xs font-bold text-white mt-1">2,500 طاقة + 12 ★</div>
+              <div className="text-xs font-bold text-white mt-1">320 طاقة + 3 ★</div>
             </div>
           </div>
           <button
@@ -490,9 +532,9 @@ export const GameModals: React.FC<GameModalsProps> = ({
         </div>
       )}
 
-      {/* 6. PACK / السرب */}
+      {/* 6. PACK / السرب ومواهب الترقية وصقل التعاويذ */}
       {modal === 'PACK' && (
-        <div className="w-full max-w-md bg-[#161923] border border-slate-700 rounded-3xl p-5 max-h-[88vh] overflow-y-auto space-y-4 relative">
+        <div className="w-full max-w-lg bg-[#161923] border border-slate-700 rounded-3xl p-5 max-h-[88vh] overflow-y-auto space-y-4 relative">
           <button onClick={onClose} className="absolute top-4 left-4 text-slate-300 hover:text-white cursor-pointer">
             <X className="w-5 h-5" />
           </button>
@@ -506,68 +548,241 @@ export const GameModals: React.FC<GameModalsProps> = ({
             </div>
           </div>
 
-          {!state.pack.joined ? (
-            <div className="space-y-3">
+          <div className="grid grid-cols-3 gap-1 p-1 rounded-2xl bg-slate-900 border border-slate-800">
+            {([
+              { id: 'CHAT', label: 'السرب والدردشة' },
+              { id: 'TALENTS', label: 'مواهب السرب' },
+              { id: 'FORGE', label: 'صقل التعاويذ' },
+            ] as const).map((tab) => (
               <button
+                key={tab.id}
                 onClick={() => {
-                  soundFX.playGodConfirm();
-                  onJoinPack();
+                  soundFX.playTabSwitch();
+                  setPackSubTab(tab.id);
                 }}
-                className="w-full py-3.5 rounded-2xl bg-gradient-to-b from-[#facc15] to-[#eab308] text-slate-950 font-black text-sm cursor-pointer"
-              >
-                الانضمام إلى {state.pack.packName} (+1,000 طاقة و +8 ★)
-              </button>
-              <div className="space-y-2 text-xs text-slate-300">
-                <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">• نشاط السرب يمنحك طاقة ومكافآت يومية</div>
-                <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">• قدرات السرب تفتح معززات الدمج التلقائي</div>
-                <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">• دردشة خاصة للتنسيق بين مروّضي التنانين</div>
-              </div>
-            </div>
-          ) : (
-            <div className="space-y-3">
-              <button
-                disabled={state.corn < 500}
-                onClick={() => {
-                  soundFX.playClaim();
-                  onContributePack(500);
-                }}
-                className={`w-full py-2.5 rounded-xl font-black text-xs ${
-                  state.corn >= 500 ? 'bg-emerald-500 text-slate-950 cursor-pointer' : 'bg-slate-800 text-slate-500'
+                className={`min-h-[40px] py-1.5 rounded-xl text-xs font-black transition-all cursor-pointer ${
+                  packSubTab === tab.id ? 'bg-slate-800 text-amber-300 border border-slate-700' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                تبرع بـ 500 طاقة لرفع قوة السرب (+10 Power و +5 ★)
+                {tab.label}
               </button>
+            ))}
+          </div>
 
-              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3 space-y-2 max-h-44 overflow-y-auto">
-                {state.pack.messages.map((m) => (
-                  <div key={m.id} className="text-xs">
-                    <span className="font-bold text-amber-400">{m.sender}: </span>
-                    <span className="text-slate-200">{m.text}</span>
-                    <span className="text-[10px] text-slate-500 mr-2 font-mono-num">{m.time}</span>
-                  </div>
-                ))}
-              </div>
-
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={packMsgInput}
-                  onChange={(e) => setPackMsgInput(e.target.value)}
-                  placeholder="اكتب رسالة للسرب..."
-                  className="flex-1 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white focus:outline-none focus:border-amber-400"
-                />
+          {packSubTab === 'CHAT' && (
+            !state.pack.joined ? (
+              <div className="space-y-3">
                 <button
                   onClick={() => {
-                    if (!packMsgInput.trim()) return;
-                    soundFX.playTapFeed();
-                    onSendPackMessage(packMsgInput.trim());
-                    setPackMsgInput('');
+                    soundFX.playGodConfirm();
+                    onJoinPack();
                   }}
-                  className="p-2.5 rounded-xl bg-amber-400 text-slate-950 cursor-pointer"
+                  className="w-full min-h-[48px] py-3.5 rounded-2xl bg-gradient-to-b from-[#facc15] to-[#eab308] text-slate-950 font-black text-sm cursor-pointer font-mono-num"
                 >
-                  <Send className="w-4 h-4" />
+                  الانضمام إلى {state.pack.packName} (+240 طاقة و +3 ★)
                 </button>
+                <div className="space-y-2 text-xs text-slate-300">
+                  <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">• نشاط السرب يمنحك طاقة ومكافآت يومية</div>
+                  <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">• مواهب السرب تفتح ترقيات دائمة لكل التنانين</div>
+                  <div className="p-3 rounded-xl bg-slate-900 border border-slate-800">• دردشة خاصة للتنسيق بين مروّضي التنانين</div>
+                </div>
               </div>
+            ) : (
+              <div className="space-y-3">
+                <button
+                  disabled={state.corn < 500}
+                  onClick={() => {
+                    soundFX.playClaim();
+                    onContributePack(500);
+                  }}
+                  className={`w-full min-h-[44px] py-2.5 rounded-xl font-black text-xs font-mono-num ${
+                    state.corn >= 500 ? 'bg-emerald-500 text-slate-950 cursor-pointer' : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                  }`}
+                >
+                  تبرع بـ 500 طاقة لرفع قوة السرب (+8 Power و +2 ★)
+                </button>
+
+                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3 space-y-2 max-h-44 overflow-y-auto">
+                  {state.pack.messages.map((m) => (
+                    <div key={m.id} className="text-xs">
+                      <span className="font-bold text-amber-400">{m.sender}: </span>
+                      <span className="text-slate-200">{m.text}</span>
+                      <span className="text-[10px] text-slate-500 mr-2 font-mono-num">{m.time}</span>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={packMsgInput}
+                    onChange={(e) => setPackMsgInput(e.target.value)}
+                    placeholder="اكتب رسالة للسرب..."
+                    className="flex-1 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white focus:outline-none focus:border-amber-400"
+                  />
+                  <button
+                    onClick={() => {
+                      if (!packMsgInput.trim()) return;
+                      soundFX.playTapFeed();
+                      onSendPackMessage(packMsgInput.trim());
+                      setPackMsgInput('');
+                    }}
+                    className="min-h-[44px] min-w-[44px] p-2.5 rounded-xl bg-amber-400 text-slate-950 cursor-pointer flex items-center justify-center"
+                  >
+                    <Send className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )
+          )}
+
+          {packSubTab === 'TALENTS' && (
+            <div className="space-y-2.5">
+              <div className="text-[11px] text-slate-300 bg-slate-900/80 border border-slate-800 rounded-xl px-3 py-2">
+                ترقيات دائمة تشمل كل تنانين السرب وتستهلك الطاقة والنجوم والذهب والميداليات لمنع تكدس الموارد.
+              </div>
+              {SQUAD_TALENT_CATALOG.map((meta) => {
+                const rank = talents[meta.key] ?? 0;
+                const maxed = rank >= ECONOMY_LIMITS.MAX_TALENT_RANK;
+                const cost = getSquadTalentCost(meta.key, rank, playerTier);
+                const canAfford =
+                  !maxed &&
+                  state.corn >= cost.corn &&
+                  state.stars >= cost.stars &&
+                  state.duckGold >= cost.gold &&
+                  state.stats.medals >= cost.medals;
+
+                return (
+                  <div
+                    key={meta.key}
+                    className="rounded-2xl bg-slate-900/90 border border-slate-800 p-3 flex items-center justify-between gap-3"
+                  >
+                    <div className="min-w-0 flex-1 space-y-0.5">
+                      <div className="flex items-center gap-2 text-xs font-black text-white">
+                        <span>{meta.nameAr}</span>
+                        <span className="font-mono-num text-[11px] text-amber-300">
+                          {rank}/{ECONOMY_LIMITS.MAX_TALENT_RANK}
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-emerald-400 font-bold">{meta.effectPerRankAr}</div>
+                      <div className="text-[10px] text-slate-400">{meta.descAr}</div>
+                      {!maxed && (
+                        <div className="flex flex-wrap items-center gap-2 pt-1 font-mono-num text-[10px] font-bold">
+                          {cost.corn > 0 && (
+                            <span className={state.corn >= cost.corn ? 'text-amber-300' : 'text-rose-400'}>
+                              {cost.corn.toLocaleString()}⚡
+                            </span>
+                          )}
+                          {cost.stars > 0 && (
+                            <span className={state.stars >= cost.stars ? 'text-indigo-300' : 'text-rose-400'}>
+                              {cost.stars}★
+                            </span>
+                          )}
+                          {cost.gold > 0 && (
+                            <span className={state.duckGold >= cost.gold ? 'text-amber-200' : 'text-rose-400'}>
+                              {cost.gold}💎
+                            </span>
+                          )}
+                          {cost.medals > 0 && (
+                            <span className={state.stats.medals >= cost.medals ? 'text-emerald-300' : 'text-rose-400'}>
+                              {cost.medals}🏅
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      disabled={!canAfford}
+                      onClick={() => onUpgradeSquadTalent(meta.key)}
+                      className={`min-h-[44px] px-3.5 py-2 rounded-xl text-xs font-black shrink-0 ${
+                        maxed
+                          ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                          : canAfford
+                            ? 'bg-amber-400 text-slate-950 hover:brightness-105 cursor-pointer'
+                            : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                      }`}
+                    >
+                      {maxed ? 'مكتمل ✓' : 'ترقية'}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {packSubTab === 'FORGE' && (
+            <div className="space-y-2.5">
+              <div className="text-[11px] text-slate-300 bg-slate-900/80 border border-slate-800 rounded-xl px-3 py-2 flex items-center gap-1.5">
+                <Flame className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>اصهر الذهب والميداليات والطاقة لصنع تعاويذ مؤقتة (24س) ومعززات دمج للمغامرات.</span>
+              </div>
+              {RELIC_FORGE_CATALOG.map((offer) => {
+                const until =
+                  offer.id === 'duel_fury'
+                    ? buffs.duelFuryUntil
+                    : offer.id === 'crit_edge'
+                      ? buffs.critEdgeUntil
+                      : offer.id === 'egg_surge'
+                        ? buffs.eggSurgeUntil
+                        : 0;
+                const hoursLeft = until > nowTs ? Math.ceil((until - nowTs) / 3600000) : 0;
+                const canAfford =
+                  state.corn >= offer.cornCost &&
+                  state.duckGold >= offer.goldCost &&
+                  state.stats.medals >= offer.medalsCost &&
+                  state.stars >= offer.starsCost;
+
+                return (
+                  <div
+                    key={offer.id}
+                    className="rounded-2xl bg-slate-900/90 border border-slate-800 p-3 flex items-center justify-between gap-3"
+                  >
+                    <div className="min-w-0 flex-1 space-y-0.5">
+                      <div className="flex items-center gap-2 text-xs font-black text-white">
+                        <Hammer className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        <span className="truncate">{offer.nameAr}</span>
+                        <span className="font-mono-num text-[10px] text-sky-300 shrink-0">
+                          {hoursLeft > 0 ? `نشط (${hoursLeft}س)` : offer.durationLabel}
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-slate-400">{offer.descAr}</div>
+                      <div className="flex flex-wrap items-center gap-2 pt-1 font-mono-num text-[10px] font-bold">
+                        {offer.cornCost > 0 && (
+                          <span className={state.corn >= offer.cornCost ? 'text-amber-300' : 'text-rose-400'}>
+                            {offer.cornCost}⚡
+                          </span>
+                        )}
+                        {offer.goldCost > 0 && (
+                          <span className={state.duckGold >= offer.goldCost ? 'text-amber-200' : 'text-rose-400'}>
+                            {offer.goldCost}💎
+                          </span>
+                        )}
+                        {offer.medalsCost > 0 && (
+                          <span className={state.stats.medals >= offer.medalsCost ? 'text-emerald-300' : 'text-rose-400'}>
+                            {offer.medalsCost}🏅
+                          </span>
+                        )}
+                        {offer.starsCost > 0 && (
+                          <span className={state.stars >= offer.starsCost ? 'text-indigo-300' : 'text-rose-400'}>
+                            {offer.starsCost}★
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <button
+                      disabled={!canAfford}
+                      onClick={() => onForgeRelic(offer.id)}
+                      className={`min-h-[44px] px-3.5 py-2 rounded-xl text-xs font-black shrink-0 ${
+                        canAfford
+                          ? 'bg-emerald-500 text-slate-950 hover:bg-emerald-400 cursor-pointer'
+                          : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                      }`}
+                    >
+                      صقل
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
@@ -626,6 +841,34 @@ export const GameModals: React.FC<GameModalsProps> = ({
             </div>
           </div>
 
+          <div className="rounded-2xl bg-slate-900/90 border border-slate-800 p-3 space-y-1.5 font-mono-num">
+            <div className="flex items-center justify-between text-[11px] font-black text-amber-300">
+              <span className="flex items-center gap-1.5">
+                <TrendingUp className="w-3.5 h-3.5" />
+                <span>مؤشر التوازن الاقتصادي اليومي</span>
+              </span>
+              <span>نسبة الحرق: {dailyBurnRatio}%</span>
+            </div>
+            <div className="grid grid-cols-3 gap-1.5 text-center text-[10px]">
+              <div className="rounded-lg bg-slate-950 p-1.5 border border-slate-800">
+                <div className="text-slate-400">المكتسب اليوم</div>
+                <div className="font-black text-emerald-400">
+                  +{(state.treasury.energyEarnedToday ?? 0).toLocaleString()}⚡
+                </div>
+              </div>
+              <div className="rounded-lg bg-slate-950 p-1.5 border border-slate-800">
+                <div className="text-slate-400">المستهلك اليوم</div>
+                <div className="font-black text-rose-400">
+                  -{(state.treasury.energyBurnedToday ?? 0).toLocaleString()}⚡
+                </div>
+              </div>
+              <div className="rounded-lg bg-slate-950 p-1.5 border border-slate-800">
+                <div className="text-slate-400">سقف الخزانة</div>
+                <div className="font-black text-amber-300">{softCap.toLocaleString()}⚡</div>
+              </div>
+            </div>
+          </div>
+
           <button
             onClick={() => {
               soundFX.playTabSwitch();
@@ -644,44 +887,57 @@ export const GameModals: React.FC<GameModalsProps> = ({
           </button>
 
           <div className="space-y-2 pt-1">
-            <div className="text-xs font-bold text-slate-400">تحويل موارد اللعب (لا يشمل DMD):</div>
+            <div className="flex items-center justify-between text-xs font-bold text-slate-400">
+              <span>تحويل موارد اللعب (الرتبة {playerTier}):</span>
+              <span className="font-mono-num text-[11px] text-amber-300">لا يشمل DMD</span>
+            </div>
             <button
-              disabled={state.corn < 2500}
+              disabled={barterStarsUsed >= ECONOMY_LIMITS.MAX_DAILY_BARTER_STARS || state.corn < walletStarsCost}
               onClick={() => {
                 soundFX.playClaim();
                 onSwapWallet('CORN_TO_STARS');
               }}
-              className={`w-full py-2.5 px-3 rounded-xl flex items-center justify-between text-xs font-bold border ${
-                state.corn >= 2500
+              className={`w-full min-h-[44px] py-2.5 px-3 rounded-xl flex items-center justify-between text-xs font-bold border ${
+                barterStarsUsed < ECONOMY_LIMITS.MAX_DAILY_BARTER_STARS && state.corn >= walletStarsCost
                   ? 'bg-slate-900 border-slate-700 hover:border-amber-400 text-white cursor-pointer'
                   : 'bg-slate-900/50 border-slate-800 text-slate-500 cursor-not-allowed'
               }`}
             >
-              <span className="flex items-center gap-1.5">
-                <CornIcon className="w-4 h-4" /> 2,500 طاقة
+              <span className="flex items-center gap-1.5 font-mono-num">
+                <CornIcon className="w-4 h-4" /> {walletStarsCost.toLocaleString()} طاقة
               </span>
-              <span className="flex items-center gap-1 text-indigo-400">
-                ← 10 <StarIcon className="w-4 h-4" />
+              <span className="flex items-center gap-1.5 text-indigo-400 font-mono-num">
+                <span>
+                  {barterStarsUsed >= ECONOMY_LIMITS.MAX_DAILY_BARTER_STARS
+                    ? 'اكتمل'
+                    : `← 10 ★ (${barterStarsUsed}/${ECONOMY_LIMITS.MAX_DAILY_BARTER_STARS})`}
+                </span>
+                <StarIcon className="w-4 h-4" />
               </span>
             </button>
 
             <button
-              disabled={state.corn < 2000}
+              disabled={barterGoldUsed >= ECONOMY_LIMITS.MAX_DAILY_BARTER_GOLD || state.corn < walletGoldCost}
               onClick={() => {
                 soundFX.playClaim();
                 onSwapWallet('CORN_TO_GOLD');
               }}
-              className={`w-full py-2.5 px-3 rounded-xl flex items-center justify-between text-xs font-bold border ${
-                state.corn >= 2000
+              className={`w-full min-h-[44px] py-2.5 px-3 rounded-xl flex items-center justify-between text-xs font-bold border ${
+                barterGoldUsed < ECONOMY_LIMITS.MAX_DAILY_BARTER_GOLD && state.corn >= walletGoldCost
                   ? 'bg-slate-900 border-slate-700 hover:border-amber-400 text-white cursor-pointer'
                   : 'bg-slate-900/50 border-slate-800 text-slate-500 cursor-not-allowed'
               }`}
             >
-              <span className="flex items-center gap-1.5">
-                <CornIcon className="w-4 h-4" /> 2,000 طاقة
+              <span className="flex items-center gap-1.5 font-mono-num">
+                <CornIcon className="w-4 h-4" /> {walletGoldCost.toLocaleString()} طاقة
               </span>
-              <span className="flex items-center gap-1 text-amber-400">
-                ← 15 <GoldIcon className="w-4 h-4" />
+              <span className="flex items-center gap-1.5 text-amber-400 font-mono-num">
+                <span>
+                  {barterGoldUsed >= ECONOMY_LIMITS.MAX_DAILY_BARTER_GOLD
+                    ? 'اكتمل'
+                    : `← 12 💎 (${barterGoldUsed}/${ECONOMY_LIMITS.MAX_DAILY_BARTER_GOLD})`}
+                </span>
+                <GoldIcon className="w-4 h-4" />
               </span>
             </button>
           </div>

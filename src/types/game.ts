@@ -55,6 +55,7 @@ export interface Duck {
   gear?: DuckGearId;
   aura?: DuckAuraId;
   skillLevel: number;
+  trainingLevel?: number; // Continuous post-LVL5 Energy combat training rank (0+)
   powerRating: number;
   unlockedAt: number;
 }
@@ -76,6 +77,14 @@ export interface TreasuryState {
   adsWatchedToday: number;
   maxAdsPerDay: number;
   totalPurchases: number;
+  dailyDateKey?: string;
+  barterStarsToday?: number;
+  barterGoldToday?: number;
+  arenaFullWinsToday?: number;
+  energyEarnedToday?: number;
+  energyBurnedToday?: number;
+  starsEarnedToday?: number;
+  starsBurnedToday?: number;
 }
 
 export type EggItemType =
@@ -170,6 +179,23 @@ export interface PackMessage {
   time: string;
 }
 
+export type SquadTalentKey = 'fury' | 'carapace' | 'incubation' | 'prestige';
+
+export interface SquadTalents {
+  fury: number;
+  carapace: number;
+  incubation: number;
+  prestige: number;
+}
+
+export type ForgeBuffId = 'duel_fury' | 'crit_edge' | 'egg_surge';
+
+export interface ActiveBuffs {
+  duelFuryUntil: number;
+  critEdgeUntil: number;
+  eggSurgeUntil: number;
+}
+
 export interface PackState {
   joined: boolean;
   packName: string;
@@ -177,6 +203,7 @@ export interface PackState {
   members: number;
   treasuryCorn: number;
   messages: PackMessage[];
+  talents?: SquadTalents;
 }
 
 export interface WalletState {
@@ -261,6 +288,7 @@ export interface GameState {
   league: LeagueState;
   battlePass: BattlePassState;
   stats: GameStats;
+  activeBuffs?: ActiveBuffs;
   autoMergeUnlocked: boolean;
   smartSellPrice: number;
   smartBuyPrice: number;

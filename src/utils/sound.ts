@@ -78,6 +78,11 @@ class SoundEngine {
     this.playTone(660, 1320, 0.22, 'sine', 0.14, 0.06);
   }
 
+  playParry() {
+    this.playTone(980, 1560, 0.09, 'triangle', 0.16, 0);
+    this.playTone(540, 1180, 0.15, 'sine', 0.14, 0.03);
+  }
+
   playVictory() {
     const notes = [523.25, 659.25, 783.99, 1046.5];
     notes.forEach((n, i) => {

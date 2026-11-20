@@ -8,6 +8,7 @@ import {
   Check,
   Calendar,
   RefreshCw,
+  Shield,
 } from 'lucide-react';
 import { Duck, DuckSkinId, GameState } from '../../types/game';
 import {
@@ -18,12 +19,15 @@ import {
   getDuckCombatStats,
   getLeagueMeta,
 } from '../../data/gameData';
+import { ECONOMY_LIMITS, getArenaEntryCost } from '../../utils/economyEngine';
 import { CornIcon, DragonIllustration, GoldIcon, StarIcon } from '../art/DuckArt';
 import { ColosseumBackdrop } from '../art/SceneBackdrops';
+import { ArenaVfxCanvas, ArenaVfxHandle } from '../art/ArenaVfxCanvas';
 import { soundFX } from '../../utils/sound';
 
 interface ArenaTabProps {
   state: GameState;
+  onSpendArenaEntry: (cost: number) => boolean;
   onBattleResult: (won: boolean, rewardCorn: number, rewardStars: number, leaguePts: number, xp: number, gold: number) => void;
   onRaceResult: (place: number, rewardCorn: number, rewardStars: number, leaguePts: number, xp: number) => void;
   onClaimDailyLeague: () => void;
@@ -41,14 +45,15 @@ interface RivalProfile {
 }
 
 const RIVALS: RivalProfile[] = [
-  { name: 'DRACO_SCOUT', skin: 'classic', maxHp: 220, attackPower: 14, rewardCorn: 650, rewardStars: 6, leaguePts: 25 },
-  { name: 'DARK_WYVERN', skin: 'skeleton', maxHp: 310, attackPower: 20, rewardCorn: 1200, rewardStars: 12, leaguePts: 40 },
-  { name: 'ZLOY_IGNIS', skin: 'ninja', maxHp: 420, attackPower: 26, rewardCorn: 2100, rewardStars: 18, leaguePts: 55 },
-  { name: 'SOLA_EMPEROR', skin: 'pharaoh', maxHp: 560, attackPower: 33, rewardCorn: 3500, rewardStars: 28, leaguePts: 75 },
+  { name: 'DRACO_SCOUT', skin: 'classic', maxHp: 220, attackPower: 14, rewardCorn: 220, rewardStars: 3, leaguePts: 25 },
+  { name: 'DARK_WYVERN', skin: 'skeleton', maxHp: 310, attackPower: 20, rewardCorn: 360, rewardStars: 5, leaguePts: 40 },
+  { name: 'ZLOY_IGNIS', skin: 'ninja', maxHp: 420, attackPower: 26, rewardCorn: 540, rewardStars: 8, leaguePts: 55 },
+  { name: 'SOLA_EMPEROR', skin: 'pharaoh', maxHp: 560, attackPower: 33, rewardCorn: 780, rewardStars: 11, leaguePts: 75 },
 ];
 
 export const ArenaTab: React.FC<ArenaTabProps> = ({
   state,
+  onSpendArenaEntry,
   onBattleResult,
   onRaceResult,
   onClaimDailyLeague,
@@ -69,6 +74,9 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
   const [enemyTelegraph, setEnemyTelegraph] = useState(0);
   const [duelShake, setDuelShake] = useState(false);
   const [hitBanner, setHitBanner] = useState<string | null>(null);
+  const [parryCd, setParryCd] = useState(0);
+  const [parriedFlash, setParriedFlash] = useState(false);
+  const vfxRef = useRef<ArenaVfxHandle | null>(null);
 
   const [racePhase, setRacePhase] = useState<'LOBBY' | 'RACING' | 'RESULT'>('LOBBY');
   const [racePositions, setRacePositions] = useState<number[]>([0, 0, 0, 0]);
@@ -87,8 +95,13 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
     activeDuck,
     state.dmdTotal,
     state.pack.joined,
-    state.pack.power
+    state.pack.power,
+    state.pack.talents,
+    state.activeBuffs
   );
+  const prestigeRank = state.pack.talents?.prestige ?? 0;
+  const duelEntryCost = getArenaEntryCost(selectedRivalIdx, prestigeRank, false);
+  const raceEntryCost = getArenaEntryCost(0, prestigeRank, true);
   const rivalScore = Math.round(rival.maxHp * 0.45 + rival.attackPower * 8);
   const winRatio = combatStats.totalPowerScore / Math.max(1, rivalScore);
   const winVerdict =
@@ -103,6 +116,7 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
     eHp: 220,
     time: 25,
     skillCd: 0,
+    parryCd: 0,
     shield: 0,
     enemyWindup: 0,
     ended: false,
@@ -117,12 +131,14 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
   });
 
   const startDuel = () => {
+    if (!onSpendArenaEntry(duelEntryCost)) return;
     const pMax = combatStats.maxHp;
     duelStateRef.current = {
       pHp: pMax,
       eHp: rival.maxHp,
       time: 25,
       skillCd: 0,
+      parryCd: 0,
       shield: 0,
       enemyWindup: 0,
       ended: false,
@@ -133,6 +149,7 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
     setEnemyHp(rival.maxHp);
     setDuelTimeLeft(25);
     setSkillCd(0);
+    setParryCd(0);
     setShieldActiveSec(0);
     setEnemyTelegraph(0);
     setDuelOutcome(null);
@@ -153,6 +170,7 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
 
       d.time = Math.max(0, d.time - dt);
       d.skillCd = Math.max(0, d.skillCd - dt);
+      d.parryCd = Math.max(0, d.parryCd - dt);
       d.shield = Math.max(0, d.shield - dt);
       d.enemyWindup += dt * 0.48;
 
@@ -161,32 +179,38 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
         const dmg = d.shield > 0 ? Math.round(rival.attackPower * 0.25) : rival.attackPower;
         d.pHp = Math.max(0, d.pHp - dmg);
         soundFX.playBattleHit();
+        vfxRef.current?.spawnAttack('ENEMY_HIT', `-${dmg}`);
       }
 
       setPlayerHp(Math.ceil(d.pHp));
       setEnemyHp(Math.ceil(d.eHp));
       setDuelTimeLeft(d.time);
       setSkillCd(d.skillCd);
+      setParryCd(d.parryCd);
       setShieldActiveSec(d.shield);
       setEnemyTelegraph(d.enemyWindup);
 
       if (d.eHp <= 0 || d.pHp <= 0 || d.time <= 0) {
         d.ended = true;
         const won = d.eHp <= 0 || (d.time <= 0 && d.pHp >= d.eHp);
+        const fullWinsToday = state.treasury.arenaFullWinsToday ?? 0;
+        const mult = fullWinsToday < ECONOMY_LIMITS.MAX_DAILY_ARENA_FULL_WINS ? 1 : ECONOMY_LIMITS.ARENA_AFTER_CAP_RATIO;
         if (won) {
           soundFX.playVictory();
+          const finalCorn = Math.round(rival.rewardCorn * mult);
+          const finalStars = Math.max(1, Math.round(rival.rewardStars * activeEvent.starBonusMult * mult));
           setDuelOutcome({
             won: true,
-            text: `انتصار ساحق على ${rival.name}! +${rival.rewardCorn.toLocaleString()} طاقة و +${rival.rewardStars * activeEvent.starBonusMult} ★`,
+            text: `انتصار ساحق على ${rival.name}! +${finalCorn.toLocaleString()} طاقة و +${finalStars} ★`,
           });
-          onBattleResult(true, rival.rewardCorn, rival.rewardStars, rival.leaguePts, 65, 3);
+          onBattleResult(true, rival.rewardCorn, rival.rewardStars, rival.leaguePts, 65, 2);
         } else {
           soundFX.playDefeat();
           setDuelOutcome({
             won: false,
-            text: `خسرت النزال أمام ${rival.name}! طوّر مهارة تنينك وأعد المحاولة (+150 طاقة مواساة).`,
+            text: `خسرت النزال أمام ${rival.name}! جرّب توقيت الصدّ المضاد (+25 طاقة مواساة).`,
           });
-          onBattleResult(false, 150, 0, 5, 20, 0);
+          onBattleResult(false, 25, 0, 5, 20, 0);
         }
         setDuelPhase('RESULT');
         return;
@@ -197,7 +221,7 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
 
     rafId = requestAnimationFrame(step);
     return () => cancelAnimationFrame(rafId);
-  }, [duelPhase, rival, activeEvent.starBonusMult, onBattleResult]);
+  }, [duelPhase, rival, activeEvent.starBonusMult, onBattleResult, state.treasury.arenaFullWinsToday]);
 
   const handlePlayerStrike = () => {
     if (duelPhase !== 'FIGHTING') return;
@@ -213,10 +237,43 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
       soundFX.playCritHit();
       setDuelShake(true);
       setHitBanner(`CRIT -${dmg}!`);
+      vfxRef.current?.spawnAttack('CRIT', `CRIT -${dmg}!`);
       setTimeout(() => setDuelShake(false), 180);
     } else {
       soundFX.playTapFeed();
       setHitBanner(`-${dmg}`);
+      vfxRef.current?.spawnAttack('FIREBALL', `-${dmg}`);
+    }
+  };
+
+  const handleCounterParry = () => {
+    if (duelPhase !== 'FIGHTING') return;
+    const d = duelStateRef.current;
+    if (d.ended || d.parryCd > 0) return;
+
+    const inWindow = d.enemyWindup >= 0.7 && d.enemyWindup <= 0.98;
+    d.parryCd = 3.2;
+
+    if (inWindow) {
+      const counterDmg = Math.round(combatStats.attack * 1.65);
+      d.enemyWindup = 0;
+      d.shield = 2.0;
+      d.eHp = Math.max(0, d.eHp - counterDmg);
+      setEnemyHp(Math.ceil(d.eHp));
+      soundFX.playParry();
+      setParriedFlash(true);
+      setDuelShake(true);
+      setHitBanner(`صد مضاد حاسم! -${counterDmg} 🛡️`);
+      vfxRef.current?.spawnAttack('PARRY', `PARRY -${counterDmg}!`);
+      setTimeout(() => {
+        setParriedFlash(false);
+        setDuelShake(false);
+      }, 240);
+    } else {
+      d.shield = 1.0;
+      soundFX.playBattleHit();
+      setHitBanner('درع مؤقت (-75% ضرر)');
+      vfxRef.current?.spawnAttack('SHIELD', 'SHIELD');
     }
   };
 
@@ -231,17 +288,23 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
 
     if (duckSkill.type === 'SHIELD') {
       d.shield = 3.5;
-      d.eHp = Math.max(0, d.eHp - Math.round(skillPower * 0.7));
+      const dmg = Math.round(skillPower * 0.7);
+      d.eHp = Math.max(0, d.eHp - dmg);
       setHitBanner(`🛡️ ${duckSkill.name}!`);
+      vfxRef.current?.spawnAttack('SHIELD', `-${dmg} 🛡️`);
     } else if (duckSkill.type === 'VAMPIRE') {
+      const heal = Math.round(skillPower * 0.9);
       d.eHp = Math.max(0, d.eHp - skillPower);
-      d.pHp = Math.min(playerMaxHp, d.pHp + Math.round(skillPower * 0.9));
-      setHitBanner(`❤️ امتصاص +${Math.round(skillPower * 0.9)} HP`);
+      d.pHp = Math.min(playerMaxHp, d.pHp + heal);
+      setHitBanner(`❤️ امتصاص +${heal} HP`);
+      vfxRef.current?.spawnAttack('VAMPIRE', `+${heal} HP`);
     } else {
-      d.eHp = Math.max(0, d.eHp - Math.round(skillPower * 1.45));
+      const dmg = Math.round(skillPower * 1.45);
+      d.eHp = Math.max(0, d.eHp - dmg);
       d.enemyWindup = Math.max(0, d.enemyWindup - 0.5);
       setDuelShake(true);
-      setHitBanner(`⚡ ${duckSkill.name} -${Math.round(skillPower * 1.45)}!`);
+      setHitBanner(`⚡ ${duckSkill.name} -${dmg}!`);
+      vfxRef.current?.spawnAttack('SHOCKWAVE', `-${dmg} ⚡`);
       setTimeout(() => setDuelShake(false), 240);
     }
   };
@@ -263,6 +326,7 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
   });
 
   const startRace = () => {
+    if (!onSpendArenaEntry(raceEntryCost)) return;
     raceStateRef.current = {
       pos: [0, 0, 0, 0],
       speeds: [6.5, 11.8 + Math.random() * 2.2, 12.2 + Math.random() * 2.5, 11.4 + Math.random() * 2.4],
@@ -310,10 +374,10 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
         const place = finishedAhead + 1;
         setRaceResultPlace(place);
         const rewardTable = [
-          { corn: 1600, stars: 15, pts: 45, xp: 60 },
-          { corn: 900, stars: 8, pts: 25, xp: 40 },
-          { corn: 450, stars: 3, pts: 12, xp: 25 },
-          { corn: 150, stars: 0, pts: 5, xp: 15 },
+          { corn: 320, stars: 5, pts: 45, xp: 60 },
+          { corn: 190, stars: 2, pts: 25, xp: 40 },
+          { corn: 95, stars: 1, pts: 12, xp: 25 },
+          { corn: 25, stars: 0, pts: 5, xp: 15 },
         ];
         const rw = rewardTable[place - 1] ?? rewardTable[3];
         if (place <= 2) soundFX.playVictory();
@@ -382,10 +446,11 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
               {state.league.points} PTS
             </span>
           </div>
-          <div className="text-[11px] text-slate-300 mt-0.5 flex items-center gap-2">
-            <span>سلسلة انتصارات: <strong className="text-amber-300 font-mono-num">{state.league.winStreak} 🔥</strong></span>
+          <div className="text-[11px] text-slate-300 mt-0.5 flex flex-wrap items-center gap-2">
+            <span>سلسلة: <strong className="text-amber-300 font-mono-num">{state.league.winStreak} 🔥</strong></span>
+            <span>· جوائز كاملة اليوم: <strong className="font-mono-num text-emerald-300">{Math.max(0, ECONOMY_LIMITS.MAX_DAILY_ARENA_FULL_WINS - (state.treasury.arenaFullWinsToday ?? 0))}/{ECONOMY_LIMITS.MAX_DAILY_ARENA_FULL_WINS}</strong></span>
             {nextLeague && (
-              <span>· التالي: {nextLeague.nameAr} ({nextLeague.minPoints})</span>
+              <span>· التالي: {nextLeague.nameAr}</span>
             )}
           </div>
         </div>
@@ -451,8 +516,9 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
 
       {/* === MODE 1: LIVE DUEL === */}
       {arenaMode === 'DUEL' && (
-        <div className={`relative overflow-hidden realistic-card border border-slate-800 rounded-3xl p-4 space-y-4 ${duelShake ? 'animate-hit-shake' : ''}`}>
+        <div className={`relative overflow-hidden realistic-card border ${parriedFlash ? 'border-emerald-400' : 'border-slate-800'} rounded-3xl p-4 space-y-4 ${duelShake ? 'animate-hit-shake' : ''}`}>
           <ColosseumBackdrop />
+          <ArenaVfxCanvas ref={vfxRef} />
           <div className="relative z-10 space-y-4">
           {duelPhase === 'LOBBY' && (
             <>
@@ -550,10 +616,16 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
 
               <button
                 onClick={startDuel}
-                className="w-full py-3.5 rounded-2xl bg-gradient-to-b from-rose-500 to-rose-600 text-white font-black text-sm shadow-lg hover:brightness-110 active:scale-95 transition-all cursor-pointer flex items-center justify-center gap-2"
+                className={`w-full min-h-[48px] py-3.5 rounded-2xl font-black text-sm shadow-lg transition-all flex items-center justify-center gap-2 ${
+                  state.corn >= duelEntryCost
+                    ? 'bg-gradient-to-b from-rose-500 to-rose-600 text-white hover:brightness-110 active:scale-95 cursor-pointer'
+                    : 'bg-slate-800 text-slate-400 cursor-not-allowed'
+                }`}
               >
                 <Swords className="w-5 h-5" />
-                <span>بدء النزال الحي ضد {rival.name}</span>
+                <span className="font-mono-num">
+                  بدء النزال الحي ضد {rival.name} · رسوم الدخول: {duelEntryCost} ⚡
+                </span>
               </button>
             </>
           )}
@@ -625,27 +697,48 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-3 gap-2">
                 <button
                   onClick={handlePlayerStrike}
-                  className="py-4 rounded-2xl bg-gradient-to-b from-[#facc15] to-[#eab308] text-slate-950 font-black text-base active:scale-95 transition-transform cursor-pointer flex items-center justify-center gap-2 shadow-lg"
+                  className="py-3.5 rounded-2xl bg-gradient-to-b from-[#facc15] to-[#eab308] text-slate-950 font-black text-sm active:scale-95 transition-transform cursor-pointer flex items-center justify-center gap-1.5 shadow-lg min-h-[48px]"
                 >
-                  <Swords className="w-5 h-5" />
-                  <span>هجوم سريع!</span>
+                  <Swords className="w-4 h-4" />
+                  <span>هجوم</span>
+                </button>
+
+                <button
+                  disabled={parryCd > 0}
+                  onClick={handleCounterParry}
+                  className={`py-3.5 rounded-2xl font-black text-xs sm:text-sm flex items-center justify-center gap-1.5 transition-all min-h-[48px] ${
+                    parryCd > 0
+                      ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                      : enemyTelegraph >= 0.7
+                        ? 'bg-emerald-400 text-slate-950 shadow-lg ring-2 ring-emerald-300 cursor-pointer active:scale-95'
+                        : 'bg-sky-500/20 border border-sky-400/50 text-sky-200 hover:bg-sky-500/30 cursor-pointer'
+                  }`}
+                >
+                  <Shield className="w-4 h-4" />
+                  <span>
+                    {parryCd > 0
+                      ? `صد (${parryCd.toFixed(1)}s)`
+                      : enemyTelegraph >= 0.7
+                        ? 'صد حرج الآن!'
+                        : 'صد مضاد'}
+                  </span>
                 </button>
 
                 <button
                   disabled={skillCd > 0}
                   onClick={handlePlayerSkill}
-                  className={`py-4 rounded-2xl font-black text-sm flex items-center justify-center gap-2 transition-all ${
+                  className={`py-3.5 rounded-2xl font-black text-xs sm:text-sm flex items-center justify-center gap-1.5 transition-all min-h-[48px] ${
                     skillCd > 0
                       ? 'bg-slate-800 text-slate-400 cursor-not-allowed'
                       : 'bg-gradient-to-b from-indigo-500 to-purple-600 text-white hover:brightness-110 active:scale-95 cursor-pointer shadow-lg'
                   }`}
                 >
-                  <Zap className="w-5 h-5" />
-                  <span>
-                    {skillCd > 0 ? `شحن (${skillCd.toFixed(1)}s)` : duckSkill.name}
+                  <Zap className="w-4 h-4" />
+                  <span className="truncate">
+                    {skillCd > 0 ? `${skillCd.toFixed(1)}s` : duckSkill.name}
                   </span>
                 </button>
               </div>
@@ -661,13 +754,17 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
               <div className="flex items-center justify-center gap-3">
                 <button
                   onClick={startDuel}
-                  className="px-6 py-3 rounded-2xl bg-amber-400 text-slate-950 font-black text-sm cursor-pointer"
+                  className={`min-h-[44px] px-6 py-3 rounded-2xl font-black text-sm font-mono-num ${
+                    state.corn >= duelEntryCost
+                      ? 'bg-amber-400 text-slate-950 cursor-pointer'
+                      : 'bg-slate-800 text-slate-400 cursor-not-allowed'
+                  }`}
                 >
-                  نزال جديد
+                  نزال جديد ({duelEntryCost} ⚡)
                 </button>
                 <button
                   onClick={() => setDuelPhase('LOBBY')}
-                  className="px-6 py-3 rounded-2xl bg-slate-800 text-slate-200 font-bold text-sm cursor-pointer"
+                  className="min-h-[44px] px-6 py-3 rounded-2xl bg-slate-800 text-slate-200 font-bold text-sm cursor-pointer"
                 >
                   تغيير الخصم
                 </button>
@@ -689,22 +786,26 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
               <p className="text-xs text-slate-300 max-w-md mx-auto leading-relaxed">
                 انقر بسرعة (أو اضغط <strong className="text-amber-300">Space</strong>) لدفع تنينك نحو خط النهاية، وفعّل مهارة التوربو لتجاوز الخصوم!
               </p>
-              <div className="grid grid-cols-3 gap-2 max-w-sm mx-auto text-xs">
+              <div className="grid grid-cols-3 gap-2 max-w-sm mx-auto text-xs font-mono-num">
                 <div className="p-2.5 rounded-xl bg-amber-400/15 border border-amber-400/40 text-amber-300 font-bold">
-                  المركز 1: 1,600 طاقة + {15 * activeEvent.starBonusMult} ★
+                  المركز 1: 320⚡ + {5 * activeEvent.starBonusMult} ★
                 </div>
                 <div className="p-2.5 rounded-xl bg-slate-800 text-slate-200 font-bold">
-                  المركز 2: 900 طاقة + {8 * activeEvent.starBonusMult} ★
+                  المركز 2: 190⚡ + {2 * activeEvent.starBonusMult} ★
                 </div>
                 <div className="p-2.5 rounded-xl bg-slate-900 text-slate-400 font-bold">
-                  المركز 3: 450 طاقة + {3 * activeEvent.starBonusMult} ★
+                  المركز 3: 95⚡ + {1 * activeEvent.starBonusMult} ★
                 </div>
               </div>
               <button
                 onClick={startRace}
-                className="w-full max-w-sm py-3.5 rounded-2xl bg-gradient-to-b from-sky-400 to-blue-600 text-white font-black text-sm hover:brightness-105 cursor-pointer"
+                className={`w-full max-w-sm min-h-[48px] py-3.5 rounded-2xl font-black text-sm font-mono-num ${
+                  state.corn >= raceEntryCost
+                    ? 'bg-gradient-to-b from-sky-400 to-blue-600 text-white hover:brightness-105 cursor-pointer'
+                    : 'bg-slate-800 text-slate-400 cursor-not-allowed'
+                }`}
               >
-                انطلاق السباق الآن! 🏁
+                انطلاق السباق! 🏁 (رسوم الدخول: {raceEntryCost} ⚡)
               </button>
             </div>
           )}
@@ -730,6 +831,16 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
                     <span className="font-mono-num text-slate-400">{Math.round(lane.pos)}%</span>
                   </div>
                   <div className="relative h-9 rounded-xl bg-slate-950/90 border border-slate-800 overflow-hidden flex items-center px-2">
+                    <div
+                      className={`absolute left-0 top-1/2 -translate-y-1/2 h-2.5 rounded-r-full transition-all duration-75 ${
+                        lane.isYou && raceTurboSec > 0
+                          ? 'bg-gradient-to-r from-rose-500 via-amber-400 to-yellow-200'
+                          : lane.isYou
+                            ? 'bg-gradient-to-r from-sky-500/40 to-amber-400/80'
+                            : 'bg-slate-700/50'
+                      }`}
+                      style={{ width: `${Math.min(90, lane.pos)}%` }}
+                    />
                     <div
                       className="absolute left-2 top-1/2 -translate-y-1/2 transition-all duration-75"
                       style={{ left: `calc(${Math.min(88, lane.pos)}% + 4px)` }}
@@ -780,9 +891,13 @@ export const ArenaTab: React.FC<ArenaTabProps> = ({
               </p>
               <button
                 onClick={startRace}
-                className="px-6 py-3 rounded-2xl bg-sky-400 text-slate-950 font-black text-sm cursor-pointer"
+                className={`min-h-[44px] px-6 py-3 rounded-2xl font-black text-sm font-mono-num ${
+                  state.corn >= raceEntryCost
+                    ? 'bg-sky-400 text-slate-950 cursor-pointer'
+                    : 'bg-slate-800 text-slate-400 cursor-not-allowed'
+                }`}
               >
-                سباق جديد
+                سباق جديد ({raceEntryCost} ⚡)
               </button>
             </div>
           )}

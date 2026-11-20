@@ -4,6 +4,13 @@ import { GameState, Rarity } from '../../types/game';
 import { RARITY_STYLE, STORE_PACKAGES, formatCompactNumber } from '../../data/gameData';
 import { CornIcon, DmdIcon, DragonIllustration, GodIllustration, StarIcon } from '../art/DuckArt';
 import { soundFX } from '../../utils/sound';
+import {
+  ECONOMY_LIMITS,
+  getBarterEnergyForStarsCost,
+  getBarterStarsToEnergyPayout,
+  getDragonSellCornPrice,
+  getPlayerTier,
+} from '../../utils/economyEngine';
 
 interface MarketTabProps {
   state: GameState;
@@ -38,6 +45,12 @@ export const MarketTab: React.FC<MarketTabProps> = ({
   const [rarityTab, setRarityTab] = useState<Rarity | 'MY_MARKET'>('UNCOMMON');
   const [timeframe, setTimeframe] = useState<string>('1ي');
   const [hoverPointIdx, setHoverPointIdx] = useState<number | null>(null);
+
+  const playerTier = getPlayerTier(state);
+  const barterEnergyCost = getBarterEnergyForStarsCost(playerTier);
+  const barterStarsPayout = getBarterStarsToEnergyPayout(playerTier);
+  const barterStarsToday = state.treasury.barterStarsToday ?? 0;
+  const barterCapReached = barterStarsToday >= ECONOMY_LIMITS.MAX_DAILY_BARTER_STARS;
 
   const filteredListings =
     rarityTab === 'MY_MARKET' ? [] : state.marketListings.filter((l) => l.rarity === rarityTab);
@@ -203,9 +216,9 @@ export const MarketTab: React.FC<MarketTabProps> = ({
 
             <div className="grid grid-cols-3 gap-2">
               {[
-                { kind: 'energy' as const, title: '+350 طاقة ⚡', sub: 'إطعام سريع' },
-                { kind: 'stars' as const, title: '+8 نجوم ★', sub: 'تخصيص وخانات' },
-                { kind: 'eggs' as const, title: '+2 بيضة 🥚', sub: 'ساحة الدمج' },
+                { kind: 'energy' as const, title: `+${ECONOMY_LIMITS.AD_ENERGY_REWARD} طاقة ⚡`, sub: 'إطعام سريع' },
+                { kind: 'stars' as const, title: `+${ECONOMY_LIMITS.AD_STARS_REWARD} نجوم ★`, sub: 'تخصيص وخانات' },
+                { kind: 'eggs' as const, title: `+${ECONOMY_LIMITS.AD_EGGS_REWARD} بيضة 🥚`, sub: 'ساحة الدمج' },
               ].map((adOpt) => {
                 const limitReached = state.treasury.adsWatchedToday >= state.treasury.maxAdsPerDay;
                 return (
@@ -213,7 +226,7 @@ export const MarketTab: React.FC<MarketTabProps> = ({
                     key={adOpt.kind}
                     disabled={limitReached}
                     onClick={() => onWatchRewardedAd(adOpt.kind)}
-                    className={`rounded-2xl p-2.5 border text-center transition-all ${
+                    className={`min-h-[48px] rounded-2xl p-2.5 border text-center transition-all ${
                       limitReached
                         ? 'bg-slate-900/50 border-slate-800 text-slate-500 cursor-not-allowed'
                         : 'bg-emerald-500/10 border-emerald-500/40 text-white hover:bg-emerald-500/20 cursor-pointer'
@@ -294,42 +307,47 @@ export const MarketTab: React.FC<MarketTabProps> = ({
             <div className="space-y-4 pb-6">
               {/* Quick Resource Barter Exchange */}
               <div className="bg-[#181b24] border border-amber-400/30 rounded-2xl p-4 space-y-2.5">
-                <h3 className="text-sm font-black text-amber-300">مقايضة الطاقة والنجوم</h3>
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-black text-amber-300">مقايضة الطاقة والنجوم (الرتبة {playerTier})</h3>
+                  <span className="font-mono-num text-[11px] font-bold text-slate-300">
+                    سقف النجوم: {barterStarsToday}/{ECONOMY_LIMITS.MAX_DAILY_BARTER_STARS} اليوم
+                  </span>
+                </div>
                 <p className="text-xs text-slate-400">
-                  بدّل طاقة الإطعام والنجوم لدعم تخصيص التنانين أو شراء بطاقات البركات.
+                  تسعير تصاعدي متوازن مع رتبك لحماية الاقتصاد ومنع التضخم.
                 </p>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   <button
-                    disabled={state.corn < 2500}
+                    disabled={barterCapReached || state.corn < barterEnergyCost}
                     onClick={() => onBarterTrade('CORN_TO_STARS')}
-                    className={`py-2.5 px-3 rounded-xl font-black text-xs flex items-center justify-between border ${
-                      state.corn >= 2500
+                    className={`min-h-[44px] py-2.5 px-3 rounded-xl font-black text-xs flex items-center justify-between border ${
+                      !barterCapReached && state.corn >= barterEnergyCost
                         ? 'bg-slate-900 border-slate-700 hover:border-amber-400 text-white cursor-pointer'
                         : 'bg-slate-900/50 border-slate-800 text-slate-500 cursor-not-allowed'
                     }`}
                   >
-                    <span className="flex items-center gap-1">
-                      <CornIcon className="w-3.5 h-3.5" /> 2.5K طاقة
+                    <span className="flex items-center gap-1 font-mono-num">
+                      <CornIcon className="w-3.5 h-3.5" /> {barterEnergyCost.toLocaleString()} طاقة
                     </span>
-                    <span className="flex items-center gap-1 text-indigo-300">
-                      ← +10 <StarIcon className="w-3.5 h-3.5" />
+                    <span className="flex items-center gap-1 text-indigo-300 font-mono-num">
+                      {barterCapReached ? 'اكتمل اليوم' : '← +10'} <StarIcon className="w-3.5 h-3.5" />
                     </span>
                   </button>
 
                   <button
                     disabled={state.stars < 10}
                     onClick={() => onBarterTrade('STARS_TO_CORN')}
-                    className={`py-2.5 px-3 rounded-xl font-black text-xs flex items-center justify-between border ${
+                    className={`min-h-[44px] py-2.5 px-3 rounded-xl font-black text-xs flex items-center justify-between border ${
                       state.stars >= 10
                         ? 'bg-slate-900 border-slate-700 hover:border-emerald-400 text-white cursor-pointer'
                         : 'bg-slate-900/50 border-slate-800 text-slate-500 cursor-not-allowed'
                     }`}
                   >
-                    <span className="flex items-center gap-1">
+                    <span className="flex items-center gap-1 font-mono-num">
                       <StarIcon className="w-3.5 h-3.5" /> 10 نجوم
                     </span>
-                    <span className="flex items-center gap-1 text-emerald-400">
-                      ← +1.8K <CornIcon className="w-3.5 h-3.5" />
+                    <span className="flex items-center gap-1 text-emerald-400 font-mono-num">
+                      ← +{formatCompactNumber(barterStarsPayout)} <CornIcon className="w-3.5 h-3.5" />
                     </span>
                   </button>
                 </div>
@@ -344,7 +362,7 @@ export const MarketTab: React.FC<MarketTabProps> = ({
                   {state.ducks
                     .filter((d) => !d.staked && state.ducks.length > 1)
                     .map((d) => {
-                      const sellPrice = Math.round(RARITY_STYLE[d.rarity].basePower * 6 + d.level * 250);
+                      const sellPrice = getDragonSellCornPrice(d, playerTier);
                       return (
                         <div
                           key={d.id}
@@ -444,7 +462,7 @@ export const MarketTab: React.FC<MarketTabProps> = ({
                           <div className="flex items-center gap-1.5">
                             <span
                               className={`font-mono-num text-lg font-black ${
-                                item.timeLeftSec <= 5 ? 'text-rose-400 animate-pulse' : 'text-white'
+                                item.timeLeftSec <= 5 ? 'text-rose-400' : 'text-white'
                               }`}
                             >
                               {String(item.timeLeftSec).padStart(2, '0')}s

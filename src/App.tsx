@@ -22,6 +22,7 @@ import {
   GameState,
   MainTab,
   Rarity,
+  SquadTalentKey,
 } from './types/game';
 import {
   BATTLE_PASS_LEVELS,
@@ -45,6 +46,25 @@ import {
   getLeagueMeta,
 } from './data/gameData';
 import { soundFX } from './utils/sound';
+import {
+  ECONOMY_LIMITS,
+  RELIC_FORGE_CATALOG,
+  RelicForgeOffer,
+  SQUAD_TALENT_CATALOG,
+  applySoftCapDamping,
+  getBarterEnergyForGoldCost,
+  getBarterEnergyForStarsCost,
+  getBarterStarsToEnergyPayout,
+  getDragonTrainingCost,
+  getEnergySoftCap,
+  getInstantSummonStarCost,
+  getMarketListingScaledCornFloor,
+  getPlayerTier,
+  getSkillUpgradeCost,
+  getSquadTalentCost,
+  getTraderDealStarCost,
+  syncDailyEconomyState,
+} from './utils/economyEngine';
 import { TitleScreen } from './components/TitleScreen';
 import { CornIcon, StarIcon } from './components/art/DuckArt';
 import { DucksTab } from './components/tabs/DucksTab';
@@ -58,6 +78,54 @@ import { ActiveModal, GameModals } from './components/modals/GameModals';
 const STORAGE_KEY = 'dragon_dmd_save_v1';
 const AUCTION_RIVALS = ['DRAGON_KING', 'ZLOYPHILIPP', 'NUBUBIICA', 'SOLAFEIFEI', 'IGNIS_LORD'];
 
+function withEarnedEnergy(
+  prev: GameState,
+  rawGain: number,
+  bypassSoftCap = false
+): { corn: number; finalGain: number; damped: boolean; treasury: GameState['treasury'] } {
+  if (rawGain <= 0) {
+    return { corn: prev.corn, finalGain: 0, damped: false, treasury: prev.treasury };
+  }
+  const tier = getPlayerTier(prev);
+  const softCap = getEnergySoftCap(tier);
+  const res = bypassSoftCap
+    ? { finalGain: Math.round(rawGain), damped: false, multiplier: 1 }
+    : applySoftCapDamping(rawGain, prev.corn, softCap);
+  return {
+    corn: prev.corn + res.finalGain,
+    finalGain: res.finalGain,
+    damped: res.damped,
+    treasury: {
+      ...prev.treasury,
+      energyEarnedToday: (prev.treasury.energyEarnedToday ?? 0) + res.finalGain,
+    },
+  };
+}
+
+function withBurnedEnergy(treasury: GameState['treasury'], cost: number): GameState['treasury'] {
+  if (cost <= 0) return treasury;
+  return {
+    ...treasury,
+    energyBurnedToday: (treasury.energyBurnedToday ?? 0) + cost,
+  };
+}
+
+function withEarnedStars(treasury: GameState['treasury'], amount: number): GameState['treasury'] {
+  if (amount <= 0) return treasury;
+  return {
+    ...treasury,
+    starsEarnedToday: (treasury.starsEarnedToday ?? 0) + amount,
+  };
+}
+
+function withBurnedStars(treasury: GameState['treasury'], amount: number): GameState['treasury'] {
+  if (amount <= 0) return treasury;
+  return {
+    ...treasury,
+    starsBurnedToday: (treasury.starsBurnedToday ?? 0) + amount,
+  };
+}
+
 function loadSavedState(): { state: GameState; hasSave: boolean } {
   const defaults = createInitialGameState();
   try {
@@ -65,27 +133,62 @@ function loadSavedState(): { state: GameState; hasSave: boolean } {
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<GameState>;
       if (parsed && Array.isArray(parsed.ducks) && Array.isArray(parsed.grid)) {
+        const tier = getPlayerTier({
+          ducks: parsed.ducks,
+          unlockedSlots: parsed.unlockedSlots ?? 3,
+        });
         const mergedDragons = parsed.ducks.map((d, idx) => ({
           ...d,
           customLevel: d.customLevel ?? 0,
           dmdStored: d.dmdStored ?? 0,
           slotIndex: d.slotIndex !== undefined ? d.slotIndex : idx < (parsed.unlockedSlots ?? 3) ? idx : null,
-          feedCost: getFeedCost(d.level ?? 1),
+          feedCost: getFeedCost(d.level ?? 1, d.rarity ?? 'COMMON', tier),
           skillLevel: d.skillLevel ?? 1,
+          trainingLevel: d.trainingLevel ?? 0,
           powerRating: d.powerRating ?? RARITY_STYLE[d.rarity].basePower + (d.level ?? 1) * 20,
         }));
+        const syncedGodCards = (parsed.godCards ?? defaults.godCards).map((g) =>
+          g.godKey === 'harvest'
+            ? {
+                ...g,
+                subtitle: 'توفير 20% طاقة إطعام',
+                bonusDesc: 'يخفض تكلفة الإطعام بنسبة 20% مع ضمان حرق صافي لا يقل عن 80% في كل نقرة.',
+              }
+            : g
+        );
         return {
-          state: {
+          state: syncDailyEconomyState({
             ...defaults,
             ...parsed,
             ducks: mergedDragons,
+            godCards: syncedGodCards,
             unlockedSlots: parsed.unlockedSlots ?? 3,
             activeDuckIndex: Math.min(parsed.activeDuckIndex ?? 0, Math.max(0, mergedDragons.length - 1)),
-            treasury: { ...defaults.treasury, ...(parsed.treasury ?? {}) },
+            treasury: {
+              ...defaults.treasury,
+              ...(parsed.treasury ?? {}),
+              maxAdsPerDay: ECONOMY_LIMITS.MAX_DAILY_ADS,
+              energyEarnedToday: parsed.treasury?.energyEarnedToday ?? 0,
+              energyBurnedToday: parsed.treasury?.energyBurnedToday ?? 0,
+              starsEarnedToday: parsed.treasury?.starsEarnedToday ?? 0,
+              starsBurnedToday: parsed.treasury?.starsBurnedToday ?? 0,
+            },
+            pack: {
+              ...defaults.pack,
+              ...(parsed.pack ?? {}),
+              talents: {
+                ...(defaults.pack.talents ?? { fury: 0, carapace: 0, incubation: 0, prestige: 0 }),
+                ...(parsed.pack?.talents ?? {}),
+              },
+            },
+            activeBuffs: {
+              ...(defaults.activeBuffs ?? { duelFuryUntil: 0, critEdgeUntil: 0, eggSurgeUntil: 0 }),
+              ...(parsed.activeBuffs ?? {}),
+            },
             league: { ...defaults.league, ...(parsed.league ?? {}) },
             battlePass: { ...defaults.battlePass, ...(parsed.battlePass ?? {}) },
             stats: { ...defaults.stats, ...(parsed.stats ?? {}) },
-          },
+          }),
           hasSave: true,
         };
       }
@@ -101,6 +204,7 @@ export default function App() {
   const [screen, setScreen] = useState<AppScreen>('TITLE');
   const [activeTab, setActiveTab] = useState<MainTab>('DUCKS');
   const [godsInitialSubTab, setGodsInitialSubTab] = useState<'TREASURES' | 'TASKS' | 'GODS'>('GODS');
+  const [packInitialSubTab, setPackInitialSubTab] = useState<'CHAT' | 'TALENTS' | 'FORGE'>('CHAT');
   const [modal, setModal] = useState<ActiveModal>(null);
   const [state, setState] = useState<GameState>(initialLoaded.state);
   const [hasSave, setHasSave] = useState<boolean>(initialLoaded.hasSave);
@@ -149,7 +253,8 @@ export default function App() {
       setTimedBonusReadyIn((sec) => Math.max(0, sec - 1));
       setBlitzSecLeft((sec) => Math.max(0, sec - 1));
 
-      setState((prev) => {
+      setState((prevRaw) => {
+        const prev = syncDailyEconomyState(prevRaw);
         let updatedDucks = prev.ducks.map((d) => {
           if (d.slotIndex === null || d.slotIndex >= prev.unlockedSlots) return d;
           const ratePerHour = getDragonDmdPerHour(d);
@@ -202,13 +307,14 @@ export default function App() {
               dmd: 0,
               dmdStored: 0,
               slotIndex: freeSlot ?? null,
-              feedCost: getFeedCost(item.level),
+              feedCost: getFeedCost(item.level, item.rarity, getPlayerTier(prev)),
               feedsProgress: item.level >= 5 ? 12 : 0,
               feedsRequired: DUCK_EVOLUTION_LEVELS[Math.max(0, Math.min(4, item.level - 1))].feedsRequired,
               staked: false,
               stakeRatePerHour: 0,
               xl: item.xl,
               skillLevel: 1,
+              trainingLevel: 0,
               powerRating: RARITY_STYLE[item.rarity].basePower + item.level * 20,
               unlockedAt: Date.now(),
             };
@@ -223,7 +329,14 @@ export default function App() {
         if (wonAuction) soundFX.playVictory();
 
         const activeCount = updatedListings.filter((l) => l.soldStatus === 'ACTIVE').length;
-        const finalListings = activeCount < 3 ? createInitialMarketListings() : updatedListings;
+        const playerTier = getPlayerTier(prev);
+        const finalListings =
+          activeCount < 3
+            ? createInitialMarketListings().map((l) => ({
+                ...l,
+                cornPrice: Math.max(l.cornPrice, getMarketListingScaledCornFloor(l.rarity, playerTier)),
+              }))
+            : updatedListings;
 
         return {
           ...prev,
@@ -246,64 +359,69 @@ export default function App() {
   const activeGodPlunder = state.godCards.some((g) => g.godKey === 'plunder' && g.owned);
   const currentWeekendEvent = WEEKEND_EVENTS[state.weekendEventIndex % WEEKEND_EVENTS.length];
 
-  // === FEEDING HANDLER (LVL 1 -> LVL 5 using Energy; strictly NO DMD generated until LVL 5 + Star Custom) ===
+  // === FEEDING HANDLER (Strictly NET Energy Burn; Combo accelerates evolution progress, NEVER refunds energy!) ===
   const handleFeedDuck = (
     duckId: string,
     comboMultiplier = 1,
     isCrit = false
-  ): { gainedEnergyBonus: number; leveledUp: boolean } | null => {
+  ): { burnedEnergy: number; tapSteps: number; leveledUp: boolean } | null => {
     const target = state.ducks.find((d) => d.id === duckId);
     if (!target || target.level >= target.maxLevel) return null;
-    const baseFeedCost = getFeedCost(target.level);
-    const effectiveCost = activeGodHarvest ? Math.ceil(baseFeedCost * 0.75) : baseFeedCost;
+    const playerTier = getPlayerTier(state);
+    const baseFeedCost = getFeedCost(target.level, target.rarity, playerTier);
+    // Harvest blessing is strictly capped at 20% reduction -> minimum 80% net Energy deduction every tap
+    const effectiveCost = activeGodHarvest ? Math.ceil(baseFeedCost * 0.8) : baseFeedCost;
     if (state.corn < effectiveCost) {
-      showToast('طاقة الإطعام غير كافية! اجمع الطاقة من البيض أو الحلبة أو الإعلان الاختياري.');
+      showToast(`طاقة الإطعام غير كافية (${effectiveCost}⚡ مطلوبة)! اجمع الطاقة من البيض أو الحلبة.`);
       return null;
     }
 
-    // Combo grants extra Energy burst when chaining consecutive feeds
-    const comboEnergyBonus = comboMultiplier >= 2 ? Math.round(effectiveCost * 0.25 * comboMultiplier) : 0;
-    const tapSteps = isCrit ? 2 : 1;
+    const comboStepBonus = comboMultiplier >= 5 ? 1 : 0;
+    const tapSteps = (isCrit ? 2 : 1) + comboStepBonus;
     const nextProgress = target.feedsProgress + tapSteps;
     const leveledUp = nextProgress >= target.feedsRequired;
     const nextLv = Math.min(target.maxLevel, target.level + 1);
     const nextEvoStage = DUCK_EVOLUTION_LEVELS[Math.max(0, Math.min(4, nextLv - 1))];
     const levelPowerGain = 30 + nextEvoStage.level * 15;
 
-    setState((prev) => ({
-      ...prev,
-      corn: prev.corn - effectiveCost + comboEnergyBonus,
-      battlePass: {
-        ...prev.battlePass,
-        xp: prev.battlePass.xp + (isCrit ? 6 : 3) + (leveledUp ? 30 : 0),
-      },
-      ducks: prev.ducks.map((d) => {
-        if (d.id !== duckId) return d;
-        if (leveledUp) {
+    setState((prev) => {
+      const nextTier = getPlayerTier(prev);
+      return {
+        ...prev,
+        corn: prev.corn - effectiveCost,
+        treasury: withBurnedEnergy(prev.treasury, effectiveCost),
+        battlePass: {
+          ...prev.battlePass,
+          xp: prev.battlePass.xp + (isCrit ? 6 : 3) + (leveledUp ? 30 : 0),
+        },
+        ducks: prev.ducks.map((d) => {
+          if (d.id !== duckId) return d;
+          if (leveledUp) {
+            return {
+              ...d,
+              level: nextLv,
+              feedCost: getFeedCost(nextLv, d.rarity, nextTier),
+              powerRating: d.powerRating + levelPowerGain,
+              feedsProgress: nextLv >= d.maxLevel ? nextEvoStage.feedsRequired : 0,
+              feedsRequired: nextEvoStage.feedsRequired,
+            };
+          }
           return {
             ...d,
-            level: nextLv,
-            feedCost: getFeedCost(nextLv),
-            powerRating: d.powerRating + levelPowerGain,
-            feedsProgress: nextLv >= d.maxLevel ? nextEvoStage.feedsRequired : 0,
-            feedsRequired: nextEvoStage.feedsRequired,
+            feedsProgress: nextProgress,
           };
-        }
-        return {
-          ...d,
-          feedsProgress: nextProgress,
-        };
-      }),
-      eggQueue: (prev.stats.totalFeeds + 1) % 3 === 0 ? [...prev.eggQueue, 'egg_1'] : prev.eggQueue,
-      stats: {
-        ...prev.stats,
-        totalFeeds: prev.stats.totalFeeds + 1,
-        hearts: prev.stats.hearts + (target.skin === 'cupid' ? 20 : 12),
-      },
-      dailyTasks: prev.dailyTasks.map((dt) =>
-        dt.id === 'dt_feed' ? { ...dt, progress: Math.min(dt.target, dt.progress + 1) } : dt
-      ),
-    }));
+        }),
+        eggQueue: (prev.stats.totalFeeds + 1) % 12 === 0 ? [...prev.eggQueue, 'egg_1'] : prev.eggQueue,
+        stats: {
+          ...prev.stats,
+          totalFeeds: prev.stats.totalFeeds + 1,
+          hearts: prev.stats.hearts + (target.skin === 'cupid' ? 14 : 8),
+        },
+        dailyTasks: prev.dailyTasks.map((dt) =>
+          dt.id === 'dt_feed' ? { ...dt, progress: Math.min(dt.target, dt.progress + 1) } : dt
+        ),
+      };
+    });
 
     if (leveledUp) {
       if (nextLv >= 5) {
@@ -312,7 +430,7 @@ export default function App() {
         showToast(`ترقى التنين إلى ${nextEvoStage.titleAr}! (+${levelPowerGain} قوة ⚡)`);
       }
     }
-    return { gainedEnergyBonus: comboEnergyBonus, leveledUp };
+    return { burnedEnergy: effectiveCost, tapSteps, leveledUp };
   };
 
   // === STAR CUSTOMIZATION UPGRADE (Custom_LVL 0 -> 10; Unlocks DMD generation at LVL 5!) ===
@@ -357,6 +475,7 @@ export default function App() {
       return {
         ...prev,
         stars: prev.stars - starCost,
+        treasury: withBurnedStars(prev.treasury, starCost),
         battlePass: { ...prev.battlePass, xp: prev.battlePass.xp + 35 },
         ducks: updatedDucks,
       };
@@ -387,7 +506,7 @@ export default function App() {
   const handleUpgradeDuckSkill = (duckId: string) => {
     const target = state.ducks.find((d) => d.id === duckId);
     if (!target || target.skillLevel >= 5) return;
-    const cost = target.skillLevel * 450;
+    const cost = getSkillUpgradeCost(target.skillLevel, getPlayerTier(state));
     if (state.corn < cost) {
       soundFX.playError();
       showToast(`تحتاج ${cost.toLocaleString()} طاقة لترقية المهارة!`);
@@ -396,6 +515,7 @@ export default function App() {
     setState((prev) => ({
       ...prev,
       corn: prev.corn - cost,
+      treasury: withBurnedEnergy(prev.treasury, cost),
       battlePass: { ...prev.battlePass, xp: prev.battlePass.xp + 25 },
       ducks: prev.ducks.map((d) =>
         d.id === duckId ? { ...d, skillLevel: d.skillLevel + 1, powerRating: d.powerRating + 38 } : d
@@ -403,6 +523,148 @@ export default function App() {
     }));
     showToast(`تمت ترقية مهارة ${target.name} إلى م${target.skillLevel + 1}! (+38 قوة)`);
   };
+
+  // === CONTINUOUS DRAGON INTENSIVE TRAINING (Unlimited Post-LVL5 Energy Sink) ===
+  const handleTrainDragon = (duckId: string) => {
+    const target = state.ducks.find((d) => d.id === duckId);
+    if (!target) return;
+    const trainRank = target.trainingLevel ?? 0;
+    const cost = getDragonTrainingCost(trainRank, getPlayerTier(state));
+    if (state.corn < cost) {
+      soundFX.playError();
+      showToast(`تحتاج ${cost.toLocaleString()} طاقة للتدريب القتالي التالي!`);
+      return;
+    }
+    soundFX.playLevelUp();
+    setState((prev) => ({
+      ...prev,
+      corn: prev.corn - cost,
+      treasury: withBurnedEnergy(prev.treasury, cost),
+      battlePass: { ...prev.battlePass, xp: prev.battlePass.xp + 20 },
+      ducks: prev.ducks.map((d) =>
+        d.id === duckId
+          ? {
+              ...d,
+              trainingLevel: (d.trainingLevel ?? 0) + 1,
+              powerRating: d.powerRating + 18,
+            }
+          : d
+      ),
+    }));
+    showToast(`💪 تم تدريب ${target.name} للرتبة ${trainRank + 1} (+14 صحة و +2 هجوم)!`);
+  };
+
+  // === 4-TRACK SQUAD TALENTS (Continuous Multi-Resource Sink) ===
+  const handleUpgradeSquadTalent = (talentKey: SquadTalentKey) => {
+    const talents = state.pack.talents ?? { fury: 0, carapace: 0, incubation: 0, prestige: 0 };
+    const currentRank = talents[talentKey] ?? 0;
+    if (currentRank >= ECONOMY_LIMITS.MAX_TALENT_RANK) {
+      soundFX.playError();
+      showToast('بلغت هذه الموهبة الحد الأقصى (20/20)!');
+      return;
+    }
+    const cost = getSquadTalentCost(talentKey, currentRank, getPlayerTier(state));
+    if (
+      state.corn < cost.corn ||
+      state.stars < cost.stars ||
+      state.duckGold < cost.gold ||
+      state.stats.medals < cost.medals
+    ) {
+      soundFX.playError();
+      showToast('الموارد غير كافية لترقية هذه الموهبة!');
+      return;
+    }
+    const meta = SQUAD_TALENT_CATALOG.find((t) => t.key === talentKey);
+    soundFX.playGodConfirm();
+    setState((prev) => {
+      const prevTalents = prev.pack.talents ?? { fury: 0, carapace: 0, incubation: 0, prestige: 0 };
+      let nextTreasury = withBurnedEnergy(prev.treasury, cost.corn);
+      nextTreasury = withBurnedStars(nextTreasury, cost.stars);
+      return {
+        ...prev,
+        corn: prev.corn - cost.corn,
+        stars: prev.stars - cost.stars,
+        duckGold: prev.duckGold - cost.gold,
+        treasury: nextTreasury,
+        battlePass: { ...prev.battlePass, xp: prev.battlePass.xp + 30 },
+        pack: {
+          ...prev.pack,
+          power: prev.pack.power + 12,
+          talents: {
+            ...prevTalents,
+            [talentKey]: (prevTalents[talentKey] ?? 0) + 1,
+          },
+        },
+        stats: {
+          ...prev.stats,
+          medals: prev.stats.medals - cost.medals,
+        },
+      };
+    });
+    showToast(`🛡️ تمت ترقية موهبة "${meta?.nameAr ?? talentKey}" إلى المستوى ${currentRank + 1}!`);
+  };
+
+  // === ADVENTURE RELIC FORGE (Continuous Gold + Medals + Stars + Energy Sink) ===
+  const handleForgeRelic = (offerId: RelicForgeOffer['id']) => {
+    const offer = RELIC_FORGE_CATALOG.find((o) => o.id === offerId);
+    if (!offer) return;
+    if (
+      state.corn < offer.cornCost ||
+      state.duckGold < offer.goldCost ||
+      state.stats.medals < offer.medalsCost ||
+      state.stars < offer.starsCost
+    ) {
+      soundFX.playError();
+      showToast('الموارد غير كافية لصقل هذه التعويذة!');
+      return;
+    }
+    soundFX.playChestOpen();
+    const durationMs = 24 * 60 * 60 * 1000;
+    const expiresAt = Date.now() + durationMs;
+    setState((prev) => {
+      const prevBuffs = prev.activeBuffs ?? { duelFuryUntil: 0, critEdgeUntil: 0, eggSurgeUntil: 0 };
+      let nextTreasury = withBurnedEnergy(prev.treasury, offer.cornCost);
+      nextTreasury = withBurnedStars(nextTreasury, offer.starsCost);
+      return {
+        ...prev,
+        corn: prev.corn - offer.cornCost,
+        duckGold: prev.duckGold - offer.goldCost,
+        stars: prev.stars - offer.starsCost,
+        treasury: nextTreasury,
+        activeBuffs: {
+          ...prevBuffs,
+          duelFuryUntil: offer.id === 'duel_fury' ? expiresAt : prevBuffs.duelFuryUntil,
+          critEdgeUntil: offer.id === 'crit_edge' ? expiresAt : prevBuffs.critEdgeUntil,
+          eggSurgeUntil: offer.id === 'egg_surge' ? expiresAt : prevBuffs.eggSurgeUntil,
+        },
+        stats: {
+          ...prev.stats,
+          medals: prev.stats.medals - offer.medalsCost,
+          hammerBoosters: prev.stats.hammerBoosters + (offer.id === 'buy_hammer' ? 1 : 0),
+          autoMergeBoosters: prev.stats.autoMergeBoosters + (offer.id === 'buy_automerge' ? 1 : 0),
+        },
+      };
+    });
+    showToast(`✨ تم تفعيل "${offer.nameAr}" بنجاح!`);
+  };
+
+  // === ARENA ENTRY TICKET SINK ===
+  const handleSpendArenaEntry = useCallback(
+    (cost: number): boolean => {
+      if (state.corn < cost) {
+        soundFX.playError();
+        showToast(`تحتاج ${cost}⚡ كرسوم دخول للحلبة!`);
+        return false;
+      }
+      setState((prev) => ({
+        ...prev,
+        corn: prev.corn - cost,
+        treasury: withBurnedEnergy(prev.treasury, cost),
+      }));
+      return true;
+    },
+    [showToast, state.corn]
+  );
 
   // === UNLOCK DRAGON SLOT (Slots 4..8 with exact Star cost & Progression requirement) ===
   const handleUnlockDragonSlot = (slotIndex: number) => {
@@ -433,23 +695,25 @@ export default function App() {
           return { ...updated, stakeRatePerHour: getDragonDmdPerHour(updated) };
         });
       } else {
+        const rarity = slotIndex >= 5 ? 'RARE' : 'UNCOMMON';
         const newDragon: Duck = {
           id: `dragon_slot_${slotIndex}_${Date.now()}`,
           name: SKIN_CATALOG[pick].name,
           skin: pick,
-          rarity: slotIndex >= 5 ? 'RARE' : 'UNCOMMON',
+          rarity,
           level: 1,
           maxLevel: 5,
           customLevel: 0,
           dmd: 0,
           dmdStored: 0,
           slotIndex,
-          feedCost: getFeedCost(1),
+          feedCost: getFeedCost(1, rarity, getPlayerTier(prev)),
           feedsProgress: 0,
           feedsRequired: 5,
           staked: false,
           stakeRatePerHour: 0,
           skillLevel: 1,
+          trainingLevel: 0,
           powerRating: slotIndex >= 5 ? 290 : 185,
           unlockedAt: Date.now(),
         };
@@ -460,6 +724,7 @@ export default function App() {
       return {
         ...prev,
         stars: prev.stars - meta.starCost,
+        treasury: withBurnedStars(prev.treasury, meta.starCost),
         unlockedSlots: slotIndex + 1,
         ducks: nextDucks,
         activeDuckIndex: targetIdx,
@@ -514,12 +779,13 @@ export default function App() {
       dmd: 0,
       dmdStored: 0,
       slotIndex: freedSlot,
-      feedCost: getFeedCost(1),
+      feedCost: getFeedCost(1, nextRarity, getPlayerTier(state)),
       feedsProgress: 0,
       feedsRequired: 5,
       staked: false,
       stakeRatePerHour: 0,
       skillLevel: 2,
+      trainingLevel: 0,
       powerRating: RARITY_STYLE[nextRarity].basePower + 55,
       unlockedAt: Date.now(),
     };
@@ -558,6 +824,7 @@ export default function App() {
     const opsShare = pkg.priceUsd * 0.5;
 
     setState((prev) => {
+      const tier = getPlayerTier(prev);
       let extraDucks = prev.ducks;
       if (pkg.legendaryDragon) {
         const freeSlot = Array.from({ length: prev.unlockedSlots }, (_, i) => i).find(
@@ -574,7 +841,7 @@ export default function App() {
           dmd: 0,
           dmdStored: 0,
           slotIndex: freeSlot ?? null,
-          feedCost: getFeedCost(3),
+          feedCost: getFeedCost(3, pkg.legendaryDragon.rarity, tier),
           feedsProgress: 0,
           feedsRequired: 9,
           staked: false,
@@ -582,25 +849,29 @@ export default function App() {
           gear: pkg.legendaryDragon.gear,
           aura: pkg.legendaryDragon.aura,
           skillLevel: 3,
+          trainingLevel: 0,
           powerRating: RARITY_STYLE.LEGENDARY.basePower + 80,
           unlockedAt: Date.now(),
         };
         extraDucks = [leg, ...prev.ducks];
       }
 
+      const energyGrant = withEarnedEnergy(prev, pkg.energyReward, true);
+      const nextTreasury = withEarnedStars(energyGrant.treasury, pkg.starsReward);
+
       return {
         ...prev,
-        corn: prev.corn + pkg.energyReward,
+        corn: energyGrant.corn,
         stars: prev.stars + pkg.starsReward,
         ducks: extraDucks,
         activeDuckIndex: pkg.legendaryDragon ? 0 : prev.activeDuckIndex,
         eggQueue: [...pkg.eggsReward, ...prev.eggQueue],
         treasury: {
-          ...prev.treasury,
-          reserveUsd: prev.treasury.reserveUsd + reserveShare,
-          opsUsd: prev.treasury.opsUsd + opsShare,
-          storeRevenueUsd: prev.treasury.storeRevenueUsd + pkg.priceUsd,
-          totalPurchases: prev.treasury.totalPurchases + 1,
+          ...nextTreasury,
+          reserveUsd: nextTreasury.reserveUsd + reserveShare,
+          opsUsd: nextTreasury.opsUsd + opsShare,
+          storeRevenueUsd: nextTreasury.storeRevenueUsd + pkg.priceUsd,
+          totalPurchases: nextTreasury.totalPurchases + 1,
         },
         stats: {
           ...prev.stats,
@@ -611,7 +882,7 @@ export default function App() {
     showToast(`تم الشراء! +$${reserveShare.toFixed(2)} إلى صندوق دعم DMD المستقبلية (50%)!`);
   };
 
-  // === OPTIONAL REWARDED AD (Capped at 5/day, feeds 50% into DMD Reserve Treasury) ===
+  // === OPTIONAL REWARDED AD (Capped at 4/day, feeds 50% into DMD Reserve Treasury) ===
   const handleWatchRewardedAd = (kind: 'energy' | 'stars' | 'eggs') => {
     if (state.treasury.adsWatchedToday >= state.treasury.maxAdsPerDay) {
       soundFX.playError();
@@ -624,22 +895,36 @@ export default function App() {
     const reserveShare = adRevenue * 0.5;
     const opsShare = adRevenue * 0.5;
 
-    setState((prev) => ({
-      ...prev,
-      corn: kind === 'energy' ? prev.corn + 350 : prev.corn,
-      stars: kind === 'stars' ? prev.stars + 8 : prev.stars,
-      eggQueue: kind === 'eggs' ? ['egg_3', 'egg_2', ...prev.eggQueue] : prev.eggQueue,
-      treasury: {
-        ...prev.treasury,
-        reserveUsd: prev.treasury.reserveUsd + reserveShare,
-        opsUsd: prev.treasury.opsUsd + opsShare,
-        adRevenueUsd: prev.treasury.adRevenueUsd + adRevenue,
-        adsWatchedToday: prev.treasury.adsWatchedToday + 1,
-      },
-    }));
+    setState((prev) => {
+      const energyGrant =
+        kind === 'energy'
+          ? withEarnedEnergy(prev, ECONOMY_LIMITS.AD_ENERGY_REWARD)
+          : { corn: prev.corn, finalGain: 0, damped: false, treasury: prev.treasury };
+      const nextTreasury =
+        kind === 'stars'
+          ? withEarnedStars(energyGrant.treasury, ECONOMY_LIMITS.AD_STARS_REWARD)
+          : energyGrant.treasury;
+      return {
+        ...prev,
+        corn: energyGrant.corn,
+        stars: kind === 'stars' ? prev.stars + ECONOMY_LIMITS.AD_STARS_REWARD : prev.stars,
+        eggQueue: kind === 'eggs' ? ['egg_1', ...prev.eggQueue] : prev.eggQueue,
+        treasury: {
+          ...nextTreasury,
+          reserveUsd: nextTreasury.reserveUsd + reserveShare,
+          opsUsd: nextTreasury.opsUsd + opsShare,
+          adRevenueUsd: nextTreasury.adRevenueUsd + adRevenue,
+          adsWatchedToday: nextTreasury.adsWatchedToday + 1,
+        },
+      };
+    });
 
     const label =
-      kind === 'energy' ? '+350 طاقة إطعام' : kind === 'stars' ? '+8 نجوم ★' : '+2 بيضة تنين';
+      kind === 'energy'
+        ? `+${ECONOMY_LIMITS.AD_ENERGY_REWARD} طاقة إطعام`
+        : kind === 'stars'
+          ? `+${ECONOMY_LIMITS.AD_STARS_REWARD} نجوم ★`
+          : `+${ECONOMY_LIMITS.AD_EGGS_REWARD} بيضة تنين`;
     showToast(`شكراً لمشاهدتك! ${label} (دعم الصندوق بـ 50% من العائد)`);
   };
 
@@ -675,42 +960,57 @@ export default function App() {
 
       const resultMeta = EGG_ITEM_META[resultItem];
       const blitzMult = blitzSecLeft > 0 ? 2 : 1;
+      const incubationMult = 1 + (state.pack.talents?.incubation ?? 0) * 0.03;
+      const surgeMult = (state.activeBuffs?.eggSurgeUntil ?? 0) > Date.now() ? 1.2 : 1;
+      const rawEnergy = Math.round(resultMeta.cornValue * blitzMult * incubationMult * surgeMult);
       soundFX.playMerge(resultMeta.tier);
 
-      setState((prev) => ({
-        ...prev,
-        corn: prev.corn + resultMeta.cornValue * blitzMult,
-        battlePass: { ...prev.battlePass, xp: prev.battlePass.xp + 6 * blitzMult },
-        stats: {
-          ...prev.stats,
-          totalMerges: prev.stats.totalMerges + 1,
-          totalEggsHatched: prev.stats.totalEggsHatched + 1,
-          hearts: prev.stats.hearts + (resultItem === 'egg_love' ? 350 : 25),
-        },
-        dailyTasks: prev.dailyTasks.map((dt) =>
-          dt.id === 'dt_merge' ? { ...dt, progress: Math.min(dt.target, dt.progress + 1) } : dt
-        ),
-        grid: prev.grid.map((c) => {
-          if (c.index === fromIndex) return { ...c, item: null, justMerged: false };
-          if (c.index === toIndex) return { ...c, item: resultItem, justMerged: true };
-          return { ...c, justMerged: false };
-        }),
-      }));
+      setState((prev) => {
+        const energyGrant = withEarnedEnergy(prev, rawEnergy);
+        return {
+          ...prev,
+          corn: energyGrant.corn,
+          treasury: energyGrant.treasury,
+          battlePass: { ...prev.battlePass, xp: prev.battlePass.xp + 6 * blitzMult },
+          stats: {
+            ...prev.stats,
+            totalMerges: prev.stats.totalMerges + 1,
+            totalEggsHatched: prev.stats.totalEggsHatched + 1,
+            hearts: prev.stats.hearts + (resultItem === 'egg_love' ? 140 : 12),
+          },
+          dailyTasks: prev.dailyTasks.map((dt) =>
+            dt.id === 'dt_merge' ? { ...dt, progress: Math.min(dt.target, dt.progress + 1) } : dt
+          ),
+          grid: prev.grid.map((c) => {
+            if (c.index === fromIndex) return { ...c, item: null, justMerged: false };
+            if (c.index === toIndex) return { ...c, item: resultItem, justMerged: true };
+            return { ...c, justMerged: false };
+          }),
+        };
+      });
     }
   };
 
   const handleStartBlitz = () => {
+    const cost = ECONOMY_LIMITS.BLITZ_ACTIVATION_COST;
+    if (state.corn < cost) {
+      soundFX.playError();
+      showToast(`تحتاج ${cost}⚡ لتفعيل موجة 2×!`);
+      return;
+    }
     setBlitzSecLeft(30);
     setState((p) => ({
       ...p,
-      eggQueue: ['egg_2', 'egg_2', 'egg_3', 'egg_1', 'egg_1', 'grapes', ...p.eggQueue],
+      corn: p.corn - cost,
+      treasury: withBurnedEnergy(p.treasury, cost),
+      eggQueue: ['egg_2', 'egg_1', 'egg_1', 'grapes', ...p.eggQueue],
     }));
-    showToast('🔥 بدأت موجة دمج بيض التنانين 2× لمدة 30 ثانية!');
+    showToast(`🔥 بدأت موجة دمج 2× لمدة 30 ثانية (-${cost}⚡)!`);
   };
 
   const handleAutoMergeBoard = (): number => {
     if (state.stats.autoMergeBoosters <= 0) {
-      showToast('لا توجد شحنات دمج تلقائي متبقية! احصل عليها من تذكرة الموسم.');
+      showToast('لا توجد شحنات دمج تلقائي متبقية! اصقلها من مواهب السرب أو تذكرة الموسم.');
       return 0;
     }
 
@@ -746,17 +1046,21 @@ export default function App() {
       return 0;
     }
 
-    setState((prev) => ({
-      ...prev,
-      corn: prev.corn + totalCornEarned,
-      battlePass: { ...prev.battlePass, xp: prev.battlePass.xp + mergesPerformed * 8 },
-      grid: nextGrid,
-      stats: {
-        ...prev.stats,
-        autoMergeBoosters: prev.stats.autoMergeBoosters - 1,
-        totalMerges: prev.stats.totalMerges + mergesPerformed,
-      },
-    }));
+    setState((prev) => {
+      const energyGrant = withEarnedEnergy(prev, totalCornEarned);
+      return {
+        ...prev,
+        corn: energyGrant.corn,
+        treasury: energyGrant.treasury,
+        battlePass: { ...prev.battlePass, xp: prev.battlePass.xp + mergesPerformed * 8 },
+        grid: nextGrid,
+        stats: {
+          ...prev.stats,
+          autoMergeBoosters: prev.stats.autoMergeBoosters - 1,
+          totalMerges: prev.stats.totalMerges + mergesPerformed,
+        },
+      };
+    });
     showToast(`⚡ الدمج الذكي نفّذ ${mergesPerformed} عمليات دمج (+${totalCornEarned} طاقة)!`);
     return mergesPerformed;
   };
@@ -810,47 +1114,62 @@ export default function App() {
     if (idx === -1) return;
 
     const blitzMult = blitzSecLeft > 0 ? 2 : 1;
+    const incubationMult = 1 + (state.pack.talents?.incubation ?? 0) * 0.03;
+    const surgeMult = (state.activeBuffs?.eggSurgeUntil ?? 0) > Date.now() ? 1.2 : 1;
+    const rawOrderCorn = Math.round(order.cornReward * blitzMult * incubationMult * surgeMult);
+    const prestigeMult = 1 + (state.pack.talents?.prestige ?? 0) * 0.03;
     const basePts = activeGodHype ? Math.round(order.trophyPoints * 1.5) : order.trophyPoints;
-    const ptsEarned = basePts * blitzMult;
+    const ptsEarned = Math.round(basePts * blitzMult * prestigeMult);
+    const goldGain = order.trophyPoints >= 10 ? 1 : 0;
     const newOrder = createRandomGodOrder(state.stats.totalErrands + 1);
 
-    setState((prev) => ({
-      ...prev,
-      corn: prev.corn + order.cornReward * blitzMult,
-      duckGold: prev.duckGold + 1,
-      battlePass: { ...prev.battlePass, xp: prev.battlePass.xp + 25 },
-      godOrders: prev.godOrders.map((o) => (o.id === orderId ? newOrder : o)),
-      grid: prev.grid.map((c) => (c.index === idx ? { ...c, item: null, justMerged: false } : c)),
-      tournament: {
-        ...prev.tournament,
-        score: prev.tournament.score + ptsEarned,
-      },
-      stats: {
-        ...prev.stats,
-        totalErrands: prev.stats.totalErrands + 1,
-        medals: prev.stats.medals + 10,
-      },
-      dailyTasks: prev.dailyTasks.map((dt) =>
-        dt.id === 'dt_errands' ? { ...dt, progress: Math.min(dt.target, dt.progress + 1) } : dt
-      ),
-    }));
-    showToast(`تم تسليم ${EGG_ITEM_META[order.wantedItem].name}! +${order.cornReward * blitzMult} طاقة و +${ptsEarned} 🏆`);
+    setState((prev) => {
+      const energyGrant = withEarnedEnergy(prev, rawOrderCorn);
+      return {
+        ...prev,
+        corn: energyGrant.corn,
+        duckGold: prev.duckGold + goldGain,
+        treasury: energyGrant.treasury,
+        battlePass: { ...prev.battlePass, xp: prev.battlePass.xp + 20 },
+        godOrders: prev.godOrders.map((o) => (o.id === orderId ? newOrder : o)),
+        grid: prev.grid.map((c) => (c.index === idx ? { ...c, item: null, justMerged: false } : c)),
+        tournament: {
+          ...prev.tournament,
+          score: prev.tournament.score + ptsEarned,
+        },
+        stats: {
+          ...prev.stats,
+          totalErrands: prev.stats.totalErrands + 1,
+          medals: prev.stats.medals + 5,
+        },
+        dailyTasks: prev.dailyTasks.map((dt) =>
+          dt.id === 'dt_errands' ? { ...dt, progress: Math.min(dt.target, dt.progress + 1) } : dt
+        ),
+      };
+    });
+    showToast(
+      `تم تسليم ${EGG_ITEM_META[order.wantedItem].name}! +${rawOrderCorn} طاقة${goldGain > 0 ? ' و +1 💎' : ''} و +${ptsEarned} 🏆`
+    );
   };
 
   const handleOpenSnackChest = (cellIndex: number) => {
-    const drops: EggItemType[] = ['grapes', 'chalice', 'cornucopia', 'feast', 'egg_4'];
-    const energyBonus = activeGodPlunder ? 610 : 450;
-    setState((prev) => ({
-      ...prev,
-      corn: prev.corn + energyBonus,
-      grid: prev.grid.map((c) => (c.index === cellIndex ? { ...c, item: 'chalice', justMerged: true } : c)),
-      eggQueue: [...drops, ...prev.eggQueue],
-      stats: {
-        ...prev.stats,
-        autoMergeBoosters: prev.stats.autoMergeBoosters + 1,
-      },
-    }));
-    showToast(`تم فتح صندوق الكنوز! +${energyBonus} طاقة و +1 معزز دمج!`);
+    const drops: EggItemType[] = ['grapes', 'egg_2'];
+    const rawBonus = activeGodPlunder ? 175 : 130;
+    setState((prev) => {
+      const energyGrant = withEarnedEnergy(prev, rawBonus);
+      return {
+        ...prev,
+        corn: energyGrant.corn,
+        treasury: energyGrant.treasury,
+        grid: prev.grid.map((c) => (c.index === cellIndex ? { ...c, item: 'chalice', justMerged: true } : c)),
+        eggQueue: [...drops, ...prev.eggQueue],
+        stats: {
+          ...prev.stats,
+          autoMergeBoosters: prev.stats.autoMergeBoosters + 1,
+        },
+      };
+    });
+    showToast(`تم فتح صندوق الكنوز! +${rawBonus} طاقة و +1 معزز دمج!`);
   };
 
   const handleUnlockGridSlot = (cellIndex: number) => {
@@ -858,6 +1177,7 @@ export default function App() {
     setState((prev) => ({
       ...prev,
       stars: prev.stars - 10,
+      treasury: withBurnedStars(prev.treasury, 10),
       grid: prev.grid.map((c) => (c.index === cellIndex ? { ...c, locked: false } : c)),
     }));
     showToast('تم فتح خانة جديدة في حقل البيض!');
@@ -873,6 +1193,7 @@ export default function App() {
       ...prev,
       duckGold: payWith === 'gold' ? prev.duckGold - god.goldCost : prev.duckGold,
       stars: payWith === 'stars' ? prev.stars - god.starCost : prev.stars,
+      treasury: payWith === 'stars' ? withBurnedStars(prev.treasury, god.starCost) : prev.treasury,
       godCards: prev.godCards.map((g) => (g.id === godId ? { ...g, owned: true, active: true } : g)),
     }));
     showToast(`تم تفعيل ${god.name} بشكل دائم!`);
@@ -912,11 +1233,11 @@ export default function App() {
     if (!mega && state.stats.medals < 100) return null;
 
     const outcomes = [
-      { label: '2,500 طاقة ⚡', type: 'corn' as const, amount: mega ? 15000 : 2500 },
-      { label: '20 نجمة ★', type: 'stars' as const, amount: mega ? 150 : 20 },
-      { label: '25 ذهب 💎', type: 'gold' as const, amount: mega ? 120 : 25 },
+      { label: mega ? '2,100 طاقة ⚡' : '420 طاقة ⚡', type: 'corn' as const, amount: mega ? 2100 : 420 },
+      { label: mega ? '28 نجوم ★' : '5 نجوم ★', type: 'stars' as const, amount: mega ? 28 : 5 },
+      { label: mega ? '22 ذهب 💎' : '5 ذهب 💎', type: 'gold' as const, amount: mega ? 22 : 5 },
       { label: 'تنين نادر 🐉', type: 'duck' as const, amount: 1 },
-      { label: '150 ميدالية 🏅', type: 'medals' as const, amount: mega ? 400 : 150 },
+      { label: mega ? '110 ميدالية 🏅' : '45 ميدالية 🏅', type: 'medals' as const, amount: mega ? 110 : 45 },
     ];
     const pick = outcomes[Math.floor(Math.random() * outcomes.length)];
 
@@ -937,22 +1258,30 @@ export default function App() {
           dmd: 0,
           dmdStored: 0,
           slotIndex: freeSlot ?? null,
-          feedCost: getFeedCost(1),
+          feedCost: getFeedCost(1, 'RARE', getPlayerTier(prev)),
           feedsProgress: 0,
           feedsRequired: 5,
           staked: false,
           stakeRatePerHour: 0,
           skillLevel: 2,
+          trainingLevel: 0,
           powerRating: 315,
           unlockedAt: Date.now(),
         };
         extraDucks = [...prev.ducks, newDragon];
       }
+      const energyGrant =
+        pick.type === 'corn'
+          ? withEarnedEnergy(prev, pick.amount)
+          : { corn: prev.corn, finalGain: 0, damped: false, treasury: prev.treasury };
+      let nextTreasury = mega ? withBurnedStars(energyGrant.treasury, 100) : energyGrant.treasury;
+      if (pick.type === 'stars') nextTreasury = withEarnedStars(nextTreasury, pick.amount);
       return {
         ...prev,
-        corn: pick.type === 'corn' ? prev.corn + pick.amount : prev.corn,
+        corn: energyGrant.corn,
         stars: (mega ? prev.stars - 100 : prev.stars) + (pick.type === 'stars' ? pick.amount : 0),
         duckGold: pick.type === 'gold' ? prev.duckGold + pick.amount : prev.duckGold,
+        treasury: nextTreasury,
         ducks: extraDucks,
         stats: {
           ...prev.stats,
@@ -967,21 +1296,25 @@ export default function App() {
 
   const handleRedeemPromo = (code: string): { ok: boolean; message: string } => {
     const valid: Record<string, { corn: number; stars: number; gold: number; label: string }> = {
-      DRAGON2026: { corn: 2000, stars: 25, gold: 0, label: '+2,000 طاقة و +25 ★' },
-      GOLD100: { corn: 0, stars: 0, gold: 40, label: '+40 ذهب تنانين' },
-      DRACO50: { corn: 1200, stars: 15, gold: 0, label: '+1,200 طاقة و +15 ★' },
+      DRAGON2026: { corn: 400, stars: 6, gold: 0, label: '+400 طاقة و +6 ★' },
+      GOLD100: { corn: 0, stars: 0, gold: 8, label: '+8 ذهب تنانين' },
+      DRACO50: { corn: 260, stars: 4, gold: 0, label: '+260 طاقة و +4 ★' },
     };
     const match = valid[code];
     if (!match) return { ok: false, message: 'الرمز غير صحيح! جرّب DRAGON2026 أو GOLD100' };
     if (state.usedPromoCodes.includes(code)) return { ok: false, message: 'تم استخدام هذا الرمز مسبقاً.' };
 
-    setState((prev) => ({
-      ...prev,
-      corn: prev.corn + match.corn,
-      stars: prev.stars + match.stars,
-      duckGold: prev.duckGold + match.gold,
-      usedPromoCodes: [...prev.usedPromoCodes, code],
-    }));
+    setState((prev) => {
+      const energyGrant = withEarnedEnergy(prev, match.corn);
+      return {
+        ...prev,
+        corn: energyGrant.corn,
+        stars: prev.stars + match.stars,
+        duckGold: prev.duckGold + match.gold,
+        treasury: withEarnedStars(energyGrant.treasury, match.stars),
+        usedPromoCodes: [...prev.usedPromoCodes, code],
+      };
+    });
     return { ok: true, message: `تم التفعيل! حصلت على ${match.label}` };
   };
 
@@ -994,6 +1327,7 @@ export default function App() {
     setState((prev) => ({
       ...prev,
       corn: prev.corn - bidCost,
+      treasury: withBurnedEnergy(prev.treasury, bidCost),
       marketListings: prev.marketListings.map((l) =>
         l.id === listingId
           ? {
@@ -1028,13 +1362,14 @@ export default function App() {
       dmd: 0,
       dmdStored: 0,
       slotIndex: freeSlot ?? null,
-      feedCost: getFeedCost(item.level),
+      feedCost: getFeedCost(item.level, item.rarity, getPlayerTier(state)),
       feedsProgress: item.level >= 5 ? 12 : 0,
       feedsRequired: DUCK_EVOLUTION_LEVELS[Math.max(0, Math.min(4, item.level - 1))].feedsRequired,
       staked: false,
       stakeRatePerHour: 0,
       xl: item.xl,
       skillLevel: 2,
+      trainingLevel: 0,
       powerRating: RARITY_STYLE[item.rarity].basePower + item.level * 20,
       unlockedAt: Date.now(),
     };
@@ -1042,6 +1377,7 @@ export default function App() {
     setState((prev) => ({
       ...prev,
       stars: prev.stars - item.starPrice,
+      treasury: withBurnedStars(prev.treasury, item.starPrice),
       ducks: [...prev.ducks, wonDragon],
       marketListings: prev.marketListings.map((l) =>
         l.id === listingId ? { ...l, soldStatus: 'SOLD_YOU', timeLeftSec: 0 } : l
@@ -1054,58 +1390,106 @@ export default function App() {
     (won: boolean, rewardCorn: number, rewardStars: number, leaguePts: number, xp: number, gold: number) => {
       const eventStarMult = won ? currentWeekendEvent.starBonusMult : 1;
       const plunderMult = activeGodPlunder && won ? 1.35 : 1;
-      const finalCorn = Math.round(rewardCorn * plunderMult);
-      const finalStars = Math.round(rewardStars * eventStarMult);
 
-      setState((prev) => ({
-        ...prev,
-        corn: prev.corn + finalCorn,
-        stars: prev.stars + finalStars,
-        duckGold: prev.duckGold + gold,
-        battlePass: { ...prev.battlePass, xp: prev.battlePass.xp + xp },
-        league: {
-          ...prev.league,
-          points: prev.league.points + leaguePts,
-          wins: won ? prev.league.wins + 1 : prev.league.wins,
-          winStreak: won ? prev.league.winStreak + 1 : 0,
-        },
-        dailyTasks: prev.dailyTasks.map((dt) =>
-          dt.id === 'dt_claims' && won ? { ...dt, progress: Math.min(dt.target, dt.progress + 1) } : dt
-        ),
-      }));
+      setState((prev) => {
+        const winsUsed = prev.treasury.arenaFullWinsToday ?? 0;
+        const capRatio = won && winsUsed >= ECONOMY_LIMITS.MAX_DAILY_ARENA_FULL_WINS
+          ? ECONOMY_LIMITS.ARENA_AFTER_CAP_RATIO
+          : 1;
+        const rawCorn = Math.max(15, Math.round(rewardCorn * plunderMult * capRatio));
+        const finalStars = won
+          ? Math.max(1, Math.round(rewardStars * eventStarMult * capRatio))
+          : rewardStars;
+        const finalGold = gold > 0 ? Math.max(1, Math.round(gold * capRatio)) : 0;
+        const prestigeMult = 1 + (prev.pack.talents?.prestige ?? 0) * 0.03;
+        const finalLeaguePts = Math.round(leaguePts * prestigeMult);
+
+        const energyGrant = withEarnedEnergy(prev, rawCorn);
+        const nextTreasury = withEarnedStars(energyGrant.treasury, finalStars);
+
+        return {
+          ...prev,
+          corn: energyGrant.corn,
+          stars: prev.stars + finalStars,
+          duckGold: prev.duckGold + finalGold,
+          battlePass: { ...prev.battlePass, xp: prev.battlePass.xp + xp },
+          treasury: {
+            ...nextTreasury,
+            arenaFullWinsToday: won
+              ? Math.min(ECONOMY_LIMITS.MAX_DAILY_ARENA_FULL_WINS + 99, winsUsed + 1)
+              : winsUsed,
+          },
+          league: {
+            ...prev.league,
+            points: prev.league.points + finalLeaguePts,
+            wins: won ? prev.league.wins + 1 : prev.league.wins,
+            winStreak: won ? prev.league.winStreak + 1 : 0,
+          },
+          dailyTasks: prev.dailyTasks.map((dt) =>
+            dt.id === 'dt_claims' && won ? { ...dt, progress: Math.min(dt.target, dt.progress + 1) } : dt
+          ),
+        };
+      });
     },
     [activeGodPlunder, currentWeekendEvent.starBonusMult]
   );
 
   const handleRaceResult = useCallback(
     (place: number, rewardCorn: number, rewardStars: number, leaguePts: number, xp: number) => {
-      const finalStars = rewardStars * currentWeekendEvent.starBonusMult;
-      setState((prev) => ({
-        ...prev,
-        corn: prev.corn + rewardCorn,
-        stars: prev.stars + finalStars,
-        battlePass: { ...prev.battlePass, xp: prev.battlePass.xp + xp },
-        league: {
-          ...prev.league,
-          points: prev.league.points + leaguePts,
-          racesWon: place === 1 ? prev.league.racesWon + 1 : prev.league.racesWon,
-        },
-      }));
-      showToast(`أنهيت السباق في المركز #${place}! +${rewardCorn.toLocaleString()} طاقة و +${finalStars} ★`);
+      const winsUsed = state.treasury.arenaFullWinsToday ?? 0;
+      const isFullWinCounted = place <= 2;
+      const capRatio = isFullWinCounted && winsUsed >= ECONOMY_LIMITS.MAX_DAILY_ARENA_FULL_WINS
+        ? ECONOMY_LIMITS.ARENA_AFTER_CAP_RATIO
+        : 1;
+      const rawCorn = Math.max(20, Math.round(rewardCorn * capRatio));
+      const finalStars = rewardStars > 0
+        ? Math.max(1, Math.round(rewardStars * currentWeekendEvent.starBonusMult * capRatio))
+        : 0;
+
+      setState((prev) => {
+        const energyGrant = withEarnedEnergy(prev, rawCorn);
+        const nextTreasury = withEarnedStars(energyGrant.treasury, finalStars);
+        const prestigeMult = 1 + (prev.pack.talents?.prestige ?? 0) * 0.03;
+        return {
+          ...prev,
+          corn: energyGrant.corn,
+          stars: prev.stars + finalStars,
+          battlePass: { ...prev.battlePass, xp: prev.battlePass.xp + xp },
+          treasury: {
+            ...nextTreasury,
+            arenaFullWinsToday: isFullWinCounted
+              ? (nextTreasury.arenaFullWinsToday ?? 0) + 1
+              : nextTreasury.arenaFullWinsToday ?? 0,
+          },
+          league: {
+            ...prev.league,
+            points: prev.league.points + Math.round(leaguePts * prestigeMult),
+            racesWon: place === 1 ? prev.league.racesWon + 1 : prev.league.racesWon,
+          },
+        };
+      });
+      showToast(
+        `أنهيت السباق في المركز #${place}! +${rawCorn.toLocaleString()} طاقة${finalStars > 0 ? ` و +${finalStars} ★` : ''}`
+      );
     },
-    [currentWeekendEvent.starBonusMult, showToast]
+    [currentWeekendEvent.starBonusMult, showToast, state.treasury.arenaFullWinsToday]
   );
 
   const handleClaimDailyLeague = () => {
     if (state.league.dailyClaimed) return;
     const meta = getLeagueMeta(state.league.points);
-    setState((p) => ({
-      ...p,
-      corn: p.corn + meta.dailyCorn,
-      stars: p.stars + meta.dailyStars,
-      duckGold: p.duckGold + meta.dailyGold,
-      league: { ...p.league, dailyClaimed: true },
-    }));
+    setState((p) => {
+      const energyGrant = withEarnedEnergy(p, meta.dailyCorn);
+      const nextTreasury = withEarnedStars(energyGrant.treasury, meta.dailyStars);
+      return {
+        ...p,
+        corn: energyGrant.corn,
+        stars: p.stars + meta.dailyStars,
+        duckGold: p.duckGold + meta.dailyGold,
+        treasury: nextTreasury,
+        league: { ...p.league, dailyClaimed: true },
+      };
+    });
     showToast(`تم استلام مكافأة ${meta.nameAr}!`);
   };
 
@@ -1115,13 +1499,22 @@ export default function App() {
     setState((prev) => {
       if (track === 'FREE') {
         if (prev.battlePass.claimedFree.includes(level)) return prev;
+        const energyGrant =
+          meta.freeType === 'corn'
+            ? withEarnedEnergy(prev, meta.freeAmount)
+            : { corn: prev.corn, finalGain: 0, damped: false, treasury: prev.treasury };
+        const nextTreasury =
+          meta.freeType === 'stars'
+            ? withEarnedStars(energyGrant.treasury, meta.freeAmount)
+            : energyGrant.treasury;
         return {
           ...prev,
-          corn: meta.freeType === 'corn' ? prev.corn + meta.freeAmount : prev.corn,
+          corn: energyGrant.corn,
           stars: meta.freeType === 'stars' ? prev.stars + meta.freeAmount : prev.stars,
+          treasury: nextTreasury,
           eggQueue:
             meta.freeType === 'eggs'
-              ? [...prev.eggQueue, ...Array.from({ length: meta.freeAmount }, () => 'egg_3' as EggItemType)]
+              ? [...prev.eggQueue, ...Array.from({ length: meta.freeAmount }, () => 'egg_2' as EggItemType)]
               : prev.eggQueue,
           battlePass: { ...prev.battlePass, claimedFree: [...prev.battlePass.claimedFree, level] },
         };
@@ -1144,12 +1537,13 @@ export default function App() {
               dmd: 0,
               dmdStored: 0,
               slotIndex: freeSlot ?? null,
-              feedCost: getFeedCost(1),
+              feedCost: getFeedCost(1, 'LEGENDARY', getPlayerTier(prev)),
               feedsProgress: 0,
               feedsRequired: 5,
               staked: false,
               stakeRatePerHour: 0,
               skillLevel: 3,
+              trainingLevel: 0,
               powerRating: 750,
               unlockedAt: Date.now(),
             },
@@ -1160,6 +1554,8 @@ export default function App() {
           ...prev,
           stars: meta.premiumType === 'stars' ? prev.stars + meta.premiumAmount : prev.stars,
           duckGold: meta.premiumType === 'gold' ? prev.duckGold + meta.premiumAmount : prev.duckGold,
+          treasury:
+            meta.premiumType === 'stars' ? withEarnedStars(prev.treasury, meta.premiumAmount) : prev.treasury,
           ducks: extraDucks,
           stats:
             meta.premiumType === 'boost'
@@ -1217,6 +1613,7 @@ export default function App() {
           <button
             onClick={() => {
               soundFX.playTabSwitch();
+              setPackInitialSubTab('CHAT');
               setModal('PACK');
             }}
             className="flex items-center gap-1 px-2 sm:px-2.5 h-8 sm:h-9 rounded-xl bg-slate-800/80 border border-slate-700/70 hover:border-rose-400/60 text-[11px] sm:text-xs font-bold text-slate-100 cursor-pointer shrink-0 whitespace-nowrap"
@@ -1287,6 +1684,11 @@ export default function App() {
             onUpgradeStarCustomization={handleUpgradeStarCustomization}
             onCollectDragonDmd={handleCollectDragonDmd}
             onUpgradeDuckSkill={handleUpgradeDuckSkill}
+            onTrainDragon={handleTrainDragon}
+            onOpenSquadTalents={() => {
+              setPackInitialSubTab('TALENTS');
+              setModal('PACK');
+            }}
             onCustomizeDuck={handleCustomizeDuck}
             onUnlockSlot={handleUnlockDragonSlot}
             onAssignSlot={handleAssignDragonToSlot}
@@ -1295,19 +1697,47 @@ export default function App() {
             onOpenDuckerPass={() => setModal('DUCKER_PASS')}
             onOpenDailyPass={() => setModal('DAILY_PASS')}
             onOpenDailyTasks={() => setModal('DAILY_TASKS')}
+            onClaimBestTask={() => {
+              const readyTask = state.dailyTasks.find((t) => !t.claimed && t.progress >= t.target);
+              if (!readyTask) {
+                setModal('DAILY_TASKS');
+                return;
+              }
+              soundFX.playClaim();
+              setState((p) => {
+                const energyGrant = withEarnedEnergy(p, readyTask.rewardEnergy);
+                return {
+                  ...p,
+                  corn: energyGrant.corn,
+                  stars: p.stars + readyTask.rewardStars,
+                  treasury: withEarnedStars(energyGrant.treasury, readyTask.rewardStars),
+                  battlePass: { ...p.battlePass, xp: p.battlePass.xp + 30 },
+                  dailyTasks: p.dailyTasks.map((t) =>
+                    t.id === readyTask.id ? { ...t, claimed: true } : t
+                  ),
+                  stats: { ...p.stats, totalTasksClaimed: p.stats.totalTasksClaimed + 1 },
+                };
+              });
+              showToast(`تم استلام مكافأة المهمة (+${readyTask.rewardStars} ★ و +${readyTask.rewardEnergy} طاقة)!`);
+            }}
             onOpenTreasures={() => {
               setGodsInitialSubTab('TREASURES');
               setActiveTab('GODS');
             }}
             onGoToArena={() => setActiveTab('ARENA')}
+            onGoToEggs={() => setActiveTab('EGGS')}
             onClaimTimedBonus={() => {
-              setTimedBonusReadyIn(45);
-              setState((p) => ({
-                ...p,
-                corn: p.corn + 250,
-                eggQueue: [...p.eggQueue, 'egg_1', 'egg_2'],
-              }));
-              showToast('تم استلام المكافأة المؤقتة (+250 طاقة و +2 بيضة تنين)!');
+              setTimedBonusReadyIn(ECONOMY_LIMITS.TIMED_BONUS_COOLDOWN_SEC);
+              setState((p) => {
+                const energyGrant = withEarnedEnergy(p, ECONOMY_LIMITS.TIMED_BONUS_ENERGY);
+                return {
+                  ...p,
+                  corn: energyGrant.corn,
+                  treasury: energyGrant.treasury,
+                  eggQueue: [...p.eggQueue, 'egg_1'],
+                };
+              });
+              showToast(`تم استلام الإمداد المؤقت (+${ECONOMY_LIMITS.TIMED_BONUS_ENERGY} طاقة و +1 بيضة تنين)!`);
             }}
             timedBonusReadyIn={timedBonusReadyIn}
           />
@@ -1332,6 +1762,7 @@ export default function App() {
         {activeTab === 'ARENA' && (
           <ArenaTab
             state={state}
+            onSpendArenaEntry={handleSpendArenaEntry}
             onBattleResult={handleBattleResult}
             onRaceResult={handleRaceResult}
             onClaimDailyLeague={handleClaimDailyLeague}
@@ -1347,12 +1778,16 @@ export default function App() {
             initialSubTab={godsInitialSubTab}
             onActivateGod={handleActivateGod}
             onClaimTreasureStep={(threshold, cornReward, starReward) => {
-              setState((p) => ({
-                ...p,
-                corn: p.corn + cornReward,
-                stars: p.stars + starReward,
-                claimedTreasureSteps: [...p.claimedTreasureSteps, threshold],
-              }));
+              setState((p) => {
+                const energyGrant = withEarnedEnergy(p, cornReward);
+                return {
+                  ...p,
+                  corn: energyGrant.corn,
+                  stars: p.stars + starReward,
+                  treasury: withEarnedStars(energyGrant.treasury, starReward),
+                  claimedTreasureSteps: [...p.claimedTreasureSteps, threshold],
+                };
+              });
               showToast(`تم استلام مكافأة الكنز (+${cornReward.toLocaleString()} طاقة و +${starReward} ★)!`);
             }}
             onOpenExchangeGold={() => setModal('WALLET')}
@@ -1367,23 +1802,31 @@ export default function App() {
             onOpenTrader={() => setModal('TRADER')}
             onFlipCoin={handleFlipCoin}
             onClaimHonorPack={(id, cost, cornReward, starReward) => {
-              setState((p) => ({
-                ...p,
-                corn: p.corn + cornReward,
-                stars: p.stars + starReward,
-                claimedHonorPacks: [...p.claimedHonorPacks, id],
-                stats: { ...p.stats, honorLetters: p.stats.honorLetters - cost },
-              }));
+              setState((p) => {
+                const energyGrant = withEarnedEnergy(p, cornReward);
+                return {
+                  ...p,
+                  corn: energyGrant.corn,
+                  stars: p.stars + starReward,
+                  treasury: withEarnedStars(energyGrant.treasury, starReward),
+                  claimedHonorPacks: [...p.claimedHonorPacks, id],
+                  stats: { ...p.stats, honorLetters: p.stats.honorLetters - cost },
+                };
+              });
               showToast(`تم استلام حزمة الشرف (+${cornReward.toLocaleString()} طاقة و +${starReward} ★)!`);
             }}
             onClaimWatchBonus={() => handleWatchRewardedAd('energy')}
             onClaimAchievement={(id, rewardCorn, rewardStars) => {
-              setState((p) => ({
-                ...p,
-                corn: p.corn + rewardCorn,
-                stars: p.stars + rewardStars,
-                claimedAchievements: [...p.claimedAchievements, id],
-              }));
+              setState((p) => {
+                const energyGrant = withEarnedEnergy(p, rewardCorn);
+                return {
+                  ...p,
+                  corn: energyGrant.corn,
+                  stars: p.stars + rewardStars,
+                  treasury: withEarnedStars(energyGrant.treasury, rewardStars),
+                  claimedAchievements: [...p.claimedAchievements, id],
+                };
+              });
               showToast('تم استلام مكافأة الإنجاز!');
             }}
             onClaimHeartMilestone={(threshold, rewardType) => {
@@ -1406,21 +1849,29 @@ export default function App() {
                       dmd: 0,
                       dmdStored: 0,
                       slotIndex: freeSlot ?? null,
-                      feedCost: getFeedCost(1),
+                      feedCost: getFeedCost(1, 'RARE', getPlayerTier(p)),
                       feedsProgress: 0,
                       feedsRequired: 5,
                       staked: false,
                       stakeRatePerHour: 0,
                       skillLevel: 2,
+                      trainingLevel: 0,
                       powerRating: 310,
                       unlockedAt: Date.now(),
                     },
                   ];
                 }
+                const energyGrant =
+                  rewardType === 'corn'
+                    ? withEarnedEnergy(p, 380)
+                    : { corn: p.corn, finalGain: 0, damped: false, treasury: p.treasury };
+                const nextTreasury =
+                  rewardType === 'stars' ? withEarnedStars(energyGrant.treasury, 4) : energyGrant.treasury;
                 return {
                   ...p,
-                  stars: rewardType === 'stars' ? p.stars + 12 : p.stars,
-                  corn: rewardType === 'corn' ? p.corn + 2000 : p.corn,
+                  stars: rewardType === 'stars' ? p.stars + 4 : p.stars,
+                  corn: energyGrant.corn,
+                  treasury: nextTreasury,
                   ducks: extraDucks,
                   claimedHeartMilestones: [...p.claimedHeartMilestones, threshold],
                 };
@@ -1428,25 +1879,35 @@ export default function App() {
               showToast('تم استلام مكافأة القلوب!');
             }}
             onClaimSocial={(id, rewardCorn) => {
-              setState((p) => ({
-                ...p,
-                corn: p.corn + rewardCorn,
-                claimedSocials: [...p.claimedSocials, id],
-              }));
+              setState((p) => {
+                const energyGrant = withEarnedEnergy(p, rewardCorn);
+                return {
+                  ...p,
+                  corn: energyGrant.corn,
+                  treasury: energyGrant.treasury,
+                  claimedSocials: [...p.claimedSocials, id],
+                };
+              });
               showToast(`+${rewardCorn} طاقة من المهام الاجتماعية!`);
             }}
             onRedeemPromo={handleRedeemPromo}
             onSpinWheel={handleSpinWheel}
             onInviteFriendSim={(premium) => {
-              setState((p) => ({
-                ...p,
-                corn: p.corn + (premium ? 1500 : 400),
-                stars: premium ? p.stars + 8 : p.stars,
-              }));
-              showToast(premium ? '+1,500 طاقة و +8 ★ من صديق مميز!' : '+400 طاقة من دعوة صديق!');
+              const rawCorn = premium ? 320 : 120;
+              const starBonus = premium ? 3 : 0;
+              setState((p) => {
+                const energyGrant = withEarnedEnergy(p, rawCorn);
+                return {
+                  ...p,
+                  corn: energyGrant.corn,
+                  stars: p.stars + starBonus,
+                  treasury: withEarnedStars(energyGrant.treasury, starBonus),
+                };
+              });
+              showToast(premium ? `+${rawCorn} طاقة و +${starBonus} ★ من صديق مميز!` : `+${rawCorn} طاقة من دعوة صديق!`);
             }}
             onInstantMerge={(rarity) => {
-              const cost = rarity === 'RARE' ? 40 : 15;
+              const cost = getInstantSummonStarCost(rarity, getPlayerTier(state));
               if (state.stars < cost) {
                 soundFX.playError();
                 showToast(`تحتاج ${cost} ★ للاستدعاء الفوري!`);
@@ -1466,18 +1927,20 @@ export default function App() {
                 dmd: 0,
                 dmdStored: 0,
                 slotIndex: freeSlot ?? null,
-                feedCost: getFeedCost(1),
+                feedCost: getFeedCost(1, rarity, getPlayerTier(state)),
                 feedsProgress: 0,
                 feedsRequired: 5,
                 staked: false,
                 stakeRatePerHour: 0,
                 skillLevel: 2,
+                trainingLevel: 0,
                 powerRating: RARITY_STYLE[rarity].basePower + 25,
                 unlockedAt: Date.now(),
               };
               setState((p) => ({
                 ...p,
                 stars: p.stars - cost,
+                treasury: withBurnedStars(p.treasury, cost),
                 ducks: [newDragon, ...p.ducks],
                 activeDuckIndex: 0,
               }));
@@ -1494,9 +1957,11 @@ export default function App() {
             onSellOwnDuck={(duckId, cornPrice) => {
               setState((p) => {
                 const remaining = p.ducks.filter((d) => d.id !== duckId);
+                const energyGrant = withEarnedEnergy(p, cornPrice);
                 return {
                   ...p,
-                  corn: p.corn + cornPrice,
+                  corn: energyGrant.corn,
+                  treasury: energyGrant.treasury,
                   ducks: remaining,
                   activeDuckIndex: 0,
                 };
@@ -1507,18 +1972,51 @@ export default function App() {
             onBuyStorePackage={handleBuyStorePackage}
             onWatchRewardedAd={handleWatchRewardedAd}
             onBarterTrade={(tradeType) => {
-              if (tradeType === 'CORN_TO_STARS' && state.corn >= 2500) {
-                soundFX.playClaim();
-                setState((p) => ({ ...p, corn: p.corn - 2500, stars: p.stars + 10 }));
-                showToast('تمت المقايضة: +10 نجوم ★ مقابل 2.5K طاقة!');
+              const tier = getPlayerTier(state);
+              const energyCost = getBarterEnergyForStarsCost(tier);
+              const energyPayout = getBarterStarsToEnergyPayout(tier);
+              const usedToday = state.treasury.barterStarsToday ?? 0;
+
+              if (tradeType === 'CORN_TO_STARS') {
+                if (usedToday >= ECONOMY_LIMITS.MAX_DAILY_BARTER_STARS) {
+                  soundFX.playError();
+                  showToast(`وصلت للحد اليومي (${ECONOMY_LIMITS.MAX_DAILY_BARTER_STARS}/${ECONOMY_LIMITS.MAX_DAILY_BARTER_STARS}) لمقايضة النجوم!`);
+                  return;
+                }
+                if (state.corn >= energyCost) {
+                  soundFX.playClaim();
+                  setState((p) => {
+                    let nextTreasury = withBurnedEnergy(p.treasury, energyCost);
+                    nextTreasury = withEarnedStars(nextTreasury, 10);
+                    return {
+                      ...p,
+                      corn: p.corn - energyCost,
+                      stars: p.stars + 10,
+                      treasury: {
+                        ...nextTreasury,
+                        barterStarsToday: (nextTreasury.barterStarsToday ?? 0) + 1,
+                      },
+                    };
+                  });
+                  showToast(`تمت المقايضة: +10 ★ مقابل ${energyCost.toLocaleString()} طاقة!`);
+                  return;
+                }
               } else if (tradeType === 'STARS_TO_CORN' && state.stars >= 10) {
                 soundFX.playClaim();
-                setState((p) => ({ ...p, stars: p.stars - 10, corn: p.corn + 1800 }));
-                showToast('تمت المقايضة: +1.8K طاقة مقابل 10 نجوم ★!');
-              } else {
-                soundFX.playError();
-                showToast('الرصيد غير كافٍ لإتمام المقايضة.');
+                setState((p) => {
+                  const energyGrant = withEarnedEnergy(p, energyPayout);
+                  return {
+                    ...p,
+                    stars: p.stars - 10,
+                    corn: energyGrant.corn,
+                    treasury: withBurnedStars(energyGrant.treasury, 10),
+                  };
+                });
+                showToast(`تمت المقايضة: +${energyPayout.toLocaleString()} طاقة مقابل 10 ★!`);
+                return;
               }
+              soundFX.playError();
+              showToast('الرصيد غير كافٍ لإتمام المقايضة.');
             }}
           />
         )}
@@ -1570,15 +2068,18 @@ export default function App() {
       <GameModals
         modal={modal}
         state={state}
+        packInitialSubTab={packInitialSubTab}
         onClose={() => setModal(null)}
         onSwitchTab={(t) => setActiveTab(t)}
+        onUpgradeSquadTalent={handleUpgradeSquadTalent}
+        onForgeRelic={handleForgeRelic}
         onClaimTournamentMilestone={(threshold, type, amount) => {
           setState((p) => ({
             ...p,
             duckGold: type === 'gold' ? p.duckGold + amount : p.duckGold,
             eggQueue:
               type === 'eggs'
-                ? [...p.eggQueue, ...Array.from({ length: amount }, () => 'egg_2' as EggItemType)]
+                ? [...p.eggQueue, ...Array.from({ length: amount }, () => 'egg_1' as EggItemType)]
                 : p.eggQueue,
             stats: {
               ...p.stats,
@@ -1592,89 +2093,116 @@ export default function App() {
           showToast('تم استلام جائزة البطولة الكبرى!');
         }}
         onBuyTraderDeal={() => {
-          if (state.stars < 20) return;
+          const dealCost = getTraderDealStarCost(getPlayerTier(state));
+          if (state.stars < dealCost) {
+            soundFX.playError();
+            showToast(`تحتاج ${dealCost} ★ لإتمام صفقة التاجر!`);
+            return;
+          }
           setState((p) => ({
             ...p,
-            stars: p.stars - 20,
-            eggQueue: ['cornucopia', 'chalice', 'egg_3', 'egg_3', 'egg_2', 'egg_2', 'egg_2', 'egg_1', ...p.eggQueue],
+            stars: p.stars - dealCost,
+            treasury: withBurnedStars(p.treasury, dealCost),
+            eggQueue: ['cornucopia', 'chalice', 'egg_3', 'egg_2', ...p.eggQueue],
             stats: { ...p.stats, traderDeals: p.stats.traderDeals + 1 },
           }));
           setModal(null);
-          showToast('تمت الصفقة! وصلت كنوز التنانين لقائمة انتظار البيض.');
+          showToast('تمت الصفقة! وصلت 4 كنوز تنانين لقائمة انتظار البيض.');
         }}
         onClaimDailyTask={(taskId) => {
           const task = state.dailyTasks.find((t) => t.id === taskId);
           if (!task || task.claimed) return;
-          setState((p) => ({
-            ...p,
-            corn: p.corn + task.rewardEnergy,
-            stars: p.stars + task.rewardStars,
-            battlePass: { ...p.battlePass, xp: p.battlePass.xp + 30 },
-            dailyTasks: p.dailyTasks.map((t) => (t.id === taskId ? { ...t, claimed: true } : t)),
-            stats: { ...p.stats, totalTasksClaimed: p.stats.totalTasksClaimed + 1 },
-          }));
+          setState((p) => {
+            const energyGrant = withEarnedEnergy(p, task.rewardEnergy);
+            return {
+              ...p,
+              corn: energyGrant.corn,
+              stars: p.stars + task.rewardStars,
+              treasury: withEarnedStars(energyGrant.treasury, task.rewardStars),
+              battlePass: { ...p.battlePass, xp: p.battlePass.xp + 30 },
+              dailyTasks: p.dailyTasks.map((t) => (t.id === taskId ? { ...t, claimed: true } : t)),
+              stats: { ...p.stats, totalTasksClaimed: p.stats.totalTasksClaimed + 1 },
+            };
+          });
           showToast(`تم استلام مكافأة المهمة (+${task.rewardStars} ★ و +${task.rewardEnergy} طاقة)!`);
         }}
         onClaimDailyLevelReward={(rewardId, cornReward, eggsReward) => {
-          setState((p) => ({
-            ...p,
-            corn: p.corn + cornReward,
-            eggQueue:
-              eggsReward > 0
-                ? [...p.eggQueue, ...Array.from({ length: eggsReward }, () => 'egg_1' as EggItemType)]
-                : p.eggQueue,
-            claimedDailyLevelRewards: [...p.claimedDailyLevelRewards, rewardId],
-          }));
+          setState((p) => {
+            const energyGrant = withEarnedEnergy(p, cornReward);
+            return {
+              ...p,
+              corn: energyGrant.corn,
+              treasury: energyGrant.treasury,
+              eggQueue:
+                eggsReward > 0
+                  ? [...p.eggQueue, ...Array.from({ length: eggsReward }, () => 'egg_1' as EggItemType)]
+                  : p.eggQueue,
+              claimedDailyLevelRewards: [...p.claimedDailyLevelRewards, rewardId],
+            };
+          });
           showToast('تم استلام مكافأة المرحلة!');
         }}
         onClaimDailyPassDay={() => {
-          setState((p) => ({
-            ...p,
-            corn: p.corn + 2500,
-            stars: p.stars + 12,
-            eggQueue: ['cornucopia', 'egg_4', 'egg_4', 'egg_4', ...p.eggQueue],
-            stats: {
-              ...p.stats,
-              dailyPassClaimedToday: true,
-              autoMergeBoosters: p.stats.autoMergeBoosters + 1,
-            },
-          }));
-          showToast('تم استلام هدية اليوم (+2,500 طاقة و +12 ★)!');
+          setState((p) => {
+            const energyGrant = withEarnedEnergy(p, 320);
+            return {
+              ...p,
+              corn: energyGrant.corn,
+              stars: p.stars + 3,
+              treasury: withEarnedStars(energyGrant.treasury, 3),
+              eggQueue: ['egg_2', 'egg_2', ...p.eggQueue],
+              stats: {
+                ...p.stats,
+                dailyPassClaimedToday: true,
+                autoMergeBoosters: p.stats.autoMergeBoosters + 1,
+              },
+            };
+          });
+          showToast('تم استلام هدية اليوم (+320 طاقة و +3 ★)!');
         }}
         onUnlockBattlePassPremium={() => {
           if (state.stars < 60 || state.battlePass.premiumUnlocked) return;
           setState((p) => ({
             ...p,
             stars: p.stars - 60,
+            treasury: withBurnedStars(p.treasury, 60),
             battlePass: { ...p.battlePass, premiumUnlocked: true },
           }));
           showToast('👑 تم تفعيل المسار الملكي لتذكرة الموسم!');
         }}
         onClaimBattlePassReward={handleClaimBattlePassReward}
         onJoinPack={() => {
-          setState((p) => ({
-            ...p,
-            corn: p.corn + 1000,
-            stars: p.stars + 8,
-            pack: { ...p.pack, joined: true, members: p.pack.members + 1 },
-          }));
-          showToast('انضممت إلى عش التنانين (+1,000 طاقة و +8 ★)!');
+          setState((p) => {
+            const energyGrant = withEarnedEnergy(p, 240);
+            return {
+              ...p,
+              corn: energyGrant.corn,
+              stars: p.stars + 3,
+              treasury: withEarnedStars(energyGrant.treasury, 3),
+              pack: { ...p.pack, joined: true, members: p.pack.members + 1 },
+            };
+          });
+          showToast('انضممت إلى عش التنانين (+240 طاقة و +3 ★)!');
         }}
         onContributePack={(amount) => {
           if (state.corn < amount) return;
-          setState((p) => ({
-            ...p,
-            corn: p.corn - amount,
-            stars: p.stars + 5,
-            autoMergeUnlocked: true,
-            pack: {
-              ...p.pack,
-              power: p.pack.power + 10,
-              treasuryCorn: p.pack.treasuryCorn + amount,
-            },
-            stats: { ...p.stats, autoMergeBoosters: p.stats.autoMergeBoosters + 1 },
-          }));
-          showToast('تم دعم السرب (+10 قوة للسرب و +5 ★ و +1 معزز دمج)!');
+          setState((p) => {
+            let nextTreasury = withBurnedEnergy(p.treasury, amount);
+            nextTreasury = withEarnedStars(nextTreasury, 2);
+            return {
+              ...p,
+              corn: p.corn - amount,
+              stars: p.stars + 2,
+              treasury: nextTreasury,
+              autoMergeUnlocked: true,
+              pack: {
+                ...p.pack,
+                power: p.pack.power + 8,
+                treasuryCorn: p.pack.treasuryCorn + amount,
+              },
+            };
+          });
+          showToast('تم دعم السرب (-500 طاقة · +8 قوة للسرب و +2 ★)!');
         }}
         onSendPackMessage={(text) => {
           setState((p) => ({
@@ -1700,16 +2228,54 @@ export default function App() {
           }));
         }}
         onSwapWallet={(direction) => {
-          setState((p) => {
-            if (direction === 'CORN_TO_STARS' && p.corn >= 2500) {
-              return { ...p, corn: p.corn - 2500, stars: p.stars + 10 };
+          const tier = getPlayerTier(state);
+          const starsEnergyCost = getBarterEnergyForStarsCost(tier);
+          const goldEnergyCost = getBarterEnergyForGoldCost(tier);
+
+          if (direction === 'CORN_TO_STARS') {
+            if ((state.treasury.barterStarsToday ?? 0) >= ECONOMY_LIMITS.MAX_DAILY_BARTER_STARS) {
+              soundFX.playError();
+              showToast('اكتمل الحد اليومي لمقايضة النجوم!');
+              return;
             }
-            if (direction === 'CORN_TO_GOLD' && p.corn >= 2000) {
-              return { ...p, corn: p.corn - 2000, duckGold: p.duckGold + 15 };
+            if (state.corn < starsEnergyCost) {
+              soundFX.playError();
+              showToast(`تحتاج ${starsEnergyCost.toLocaleString()} طاقة!`);
+              return;
             }
-            return p;
-          });
-          showToast('تمت عملية التحويل بنجاح!');
+            setState((p) => {
+              let nextTreasury = withBurnedEnergy(p.treasury, starsEnergyCost);
+              nextTreasury = withEarnedStars(nextTreasury, 10);
+              return {
+                ...p,
+                corn: p.corn - starsEnergyCost,
+                stars: p.stars + 10,
+                treasury: { ...nextTreasury, barterStarsToday: (nextTreasury.barterStarsToday ?? 0) + 1 },
+              };
+            });
+            showToast(`تمت المقايضة: +10 ★ مقابل ${starsEnergyCost.toLocaleString()} طاقة!`);
+          } else if (direction === 'CORN_TO_GOLD') {
+            if ((state.treasury.barterGoldToday ?? 0) >= ECONOMY_LIMITS.MAX_DAILY_BARTER_GOLD) {
+              soundFX.playError();
+              showToast('اكتمل الحد اليومي لمقايضة الذهب!');
+              return;
+            }
+            if (state.corn < goldEnergyCost) {
+              soundFX.playError();
+              showToast(`تحتاج ${goldEnergyCost.toLocaleString()} طاقة!`);
+              return;
+            }
+            setState((p) => {
+              const nextTreasury = withBurnedEnergy(p.treasury, goldEnergyCost);
+              return {
+                ...p,
+                corn: p.corn - goldEnergyCost,
+                duckGold: p.duckGold + 12,
+                treasury: { ...nextTreasury, barterGoldToday: (nextTreasury.barterGoldToday ?? 0) + 1 },
+              };
+            });
+            showToast(`تمت المقايضة: +12 ذهب 💎 مقابل ${goldEnergyCost.toLocaleString()} طاقة!`);
+          }
         }}
         onToggleMute={() => setState((p) => ({ ...p, muted: !p.muted }))}
         onBackToTitle={() => {

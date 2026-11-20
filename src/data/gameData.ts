@@ -1,4 +1,5 @@
 import {
+  ActiveBuffs,
   DragonSlotMeta,
   Duck,
   DuckAuraId,
@@ -15,7 +16,9 @@ import {
   LeagueTier,
   MarketListing,
   Rarity,
+  SquadTalents,
 } from '../types/game';
+import { calculateDragonFeedCost } from '../utils/economyEngine';
 
 export const RARITY_ORDER: Rarity[] = ['COMMON', 'UNCOMMON', 'RARE', 'EPIC', 'LEGENDARY'];
 
@@ -62,8 +65,8 @@ export const RARITY_STYLE: Record<
     glow: 'from-sky-500/35 via-indigo-500/10 to-transparent',
     border: 'border-sky-500/50',
     bg: 'bg-sky-500/15',
-    baseDmdPerHour: 1.6,
-    maxCapHours: 8,
+    baseDmdPerHour: 1.5,
+    maxCapHours: 6,
     basePower: 290,
   },
   EPIC: {
@@ -73,8 +76,8 @@ export const RARITY_STYLE: Record<
     glow: 'from-purple-500/35 via-fuchsia-500/10 to-transparent',
     border: 'border-purple-500/50',
     bg: 'bg-purple-500/15',
-    baseDmdPerHour: 3.1,
-    maxCapHours: 10,
+    baseDmdPerHour: 2.5,
+    maxCapHours: 8,
     basePower: 440,
   },
   LEGENDARY: {
@@ -84,20 +87,24 @@ export const RARITY_STYLE: Record<
     glow: 'from-amber-400/40 via-orange-500/15 to-transparent',
     border: 'border-amber-400/60',
     bg: 'bg-amber-500/15',
-    baseDmdPerHour: 6.0,
+    baseDmdPerHour: 4.0,
     maxCapHours: 12,
     basePower: 680,
   },
 };
 
-// Exact Feeding Cost Formula: 15 * (1.30)^(LVL - 1)
-export function getFeedCost(level: number): number {
-  return Math.round(15 * Math.pow(1.3, Math.max(0, level - 1)));
+// Rarity & Tier-Aware Feeding Cost Formula: ceil(28 * 1.48^(LVL-1) * M_R * (1 + 0.10*(T-1)))
+export function getFeedCost(
+  level: number,
+  rarity: Rarity = 'COMMON',
+  playerTier = 1
+): number {
+  return calculateDragonFeedCost(level, rarity, playerTier);
 }
 
-// Exact Star Customization Cost Formula: 10 * (1.35)^Custom_LVL (0 -> 10)
+// Exact Star Customization Cost Formula: ceil(10 * (1.35)^Custom_LVL)
 export function getCustomUpgradeCost(customLevel: number): number {
-  return Math.round(10 * Math.pow(1.35, Math.max(0, customLevel)));
+  return Math.ceil(10 * Math.pow(1.35, Math.max(0, customLevel)));
 }
 
 // Unified Diminishing Returns Law across ALL players:
@@ -333,31 +340,45 @@ export function getDuckCombatStats(
   duck: Duck,
   totalDmd: number,
   packJoined: boolean,
-  packPower: number
+  packPower: number,
+  talents?: SquadTalents,
+  activeBuffs?: ActiveBuffs
 ) {
+  const now = Date.now();
   const gearBonus = DUCK_GEAR_CATALOG.find((g) => g.id === (duck.gear ?? 'none'))?.powerBonus ?? 0;
   const customPowerBonus = duck.customLevel * 28;
+  const trainLv = duck.trainingLevel ?? 0;
+  const furyPct = (talents?.fury ?? 0) * 2.5;
+  const carapacePct = (talents?.carapace ?? 0) * 3;
+  const buffFuryPct = activeBuffs && activeBuffs.duelFuryUntil > now ? 20 : 0;
+  const buffCritBonus = activeBuffs && activeBuffs.critEdgeUntil > now ? 15 : 0;
+
   const dmdSynergyPct = Math.min(35, Math.round(totalDmd * 0.4));
   const packSynergyPct = packJoined ? 10 + Math.min(20, Math.floor(packPower / 30)) : 0;
-  const totalMult = 1 + (dmdSynergyPct + packSynergyPct) / 100;
+  const baseMult = 1 + (dmdSynergyPct + packSynergyPct) / 100;
 
   const baseHp =
     240 +
     duck.level * 24 +
     duck.skillLevel * 20 +
+    trainLv * 14 +
     Math.round((duck.powerRating + gearBonus + customPowerBonus) * 0.35) +
     (duck.gear === 'helmet' ? 25 : 0);
-  const maxHp = Math.round(baseHp * totalMult);
+  const maxHp = Math.round(baseHp * (baseMult + carapacePct / 100));
 
   const baseAtk =
     12 +
     duck.level * 2 +
     duck.skillLevel * 3 +
+    trainLv * 2 +
     Math.round((duck.powerRating + gearBonus + customPowerBonus) * 0.04);
-  const attack = Math.round(baseAtk * totalMult);
+  const attack = Math.round(baseAtk * (baseMult + (furyPct + buffFuryPct) / 100));
 
   const baseCrit = duck.skin === 'gamer' || duck.skin === 'ninja' ? 34 : 20;
-  const critChance = baseCrit + (duck.gear === 'shades' ? 6 : 0) + Math.min(10, duck.customLevel);
+  const critChance = Math.min(
+    85,
+    baseCrit + (duck.gear === 'shades' ? 6 : 0) + Math.min(10, duck.customLevel) + buffCritBonus
+  );
 
   return {
     maxHp,
@@ -365,6 +386,7 @@ export function getDuckCombatStats(
     critChance,
     dmdSynergyPct,
     packSynergyPct,
+    trainingLevel: trainLv,
     totalPowerScore: Math.round(maxHp * 0.45 + attack * 8 + critChance * 2),
   };
 }
@@ -562,9 +584,9 @@ export const LEAGUE_TIERS: LeagueTierMeta[] = [
     color: 'text-orange-300',
     bg: 'bg-orange-500/15',
     border: 'border-orange-500/40',
-    dailyCorn: 1200,
-    dailyStars: 8,
-    dailyGold: 5,
+    dailyCorn: 220,
+    dailyStars: 2,
+    dailyGold: 1,
   },
   {
     tier: 'SILVER',
@@ -573,9 +595,9 @@ export const LEAGUE_TIERS: LeagueTierMeta[] = [
     color: 'text-slate-200',
     bg: 'bg-slate-400/15',
     border: 'border-slate-400/40',
-    dailyCorn: 2500,
-    dailyStars: 16,
-    dailyGold: 10,
+    dailyCorn: 380,
+    dailyStars: 3,
+    dailyGold: 2,
   },
   {
     tier: 'GOLD',
@@ -584,9 +606,9 @@ export const LEAGUE_TIERS: LeagueTierMeta[] = [
     color: 'text-amber-300',
     bg: 'bg-amber-400/15',
     border: 'border-amber-400/50',
-    dailyCorn: 5000,
-    dailyStars: 28,
-    dailyGold: 20,
+    dailyCorn: 580,
+    dailyStars: 5,
+    dailyGold: 3,
   },
   {
     tier: 'DIAMOND',
@@ -595,9 +617,9 @@ export const LEAGUE_TIERS: LeagueTierMeta[] = [
     color: 'text-sky-300',
     bg: 'bg-sky-400/15',
     border: 'border-sky-400/50',
-    dailyCorn: 9500,
-    dailyStars: 45,
-    dailyGold: 35,
+    dailyCorn: 820,
+    dailyStars: 7,
+    dailyGold: 4,
   },
   {
     tier: 'LEGENDARY',
@@ -606,9 +628,9 @@ export const LEAGUE_TIERS: LeagueTierMeta[] = [
     color: 'text-rose-300',
     bg: 'bg-rose-500/15',
     border: 'border-rose-400/60',
-    dailyCorn: 18000,
-    dailyStars: 80,
-    dailyGold: 75,
+    dailyCorn: 1100,
+    dailyStars: 10,
+    dailyGold: 6,
   },
 ];
 
@@ -633,22 +655,27 @@ export interface BattlePassLevelReward {
 
 export const BATTLE_PASS_LEVELS: BattlePassLevelReward[] = Array.from({ length: 15 }, (_, i) => {
   const lv = i + 1;
+  const freeStars = Math.max(2, Math.round(lv * 0.9));
+  const freeEggs = Math.min(3, Math.ceil(lv / 4));
+  const freeCorn = lv * 110;
+  const premGold = Math.max(2, Math.round(lv * 1.5));
+  const premStars = Math.max(3, Math.round(lv * 2));
   return {
     level: lv,
     xpRequired: lv * 100,
-    freeLabel: lv % 3 === 0 ? `+${lv * 4} ★` : lv % 2 === 0 ? `+${lv * 3} بيضة` : `+${(lv * 600).toLocaleString()} طاقة`,
+    freeLabel: lv % 3 === 0 ? `+${freeStars} ★` : lv % 2 === 0 ? `+${freeEggs} بيضة` : `+${freeCorn.toLocaleString()} طاقة`,
     freeType: lv % 3 === 0 ? 'stars' : lv % 2 === 0 ? 'eggs' : 'corn',
-    freeAmount: lv % 3 === 0 ? lv * 4 : lv % 2 === 0 ? lv * 3 : lv * 600,
+    freeAmount: lv % 3 === 0 ? freeStars : lv % 2 === 0 ? freeEggs : freeCorn,
     premiumLabel:
       lv === 15
         ? 'تنين أسطوري 👑'
         : lv % 4 === 0
-          ? '+2 معزز دمج ⚡'
+          ? '+1 معزز دمج ⚡'
           : lv % 2 === 0
-            ? `+${lv * 8} ذهب 💎`
-            : `+${lv * 10} ★`,
+            ? `+${premGold} ذهب 💎`
+            : `+${premStars} ★`,
     premiumType: lv === 15 ? 'duck' : lv % 4 === 0 ? 'boost' : lv % 2 === 0 ? 'gold' : 'stars',
-    premiumAmount: lv === 15 ? 1 : lv % 4 === 0 ? 2 : lv % 2 === 0 ? lv * 8 : lv * 10,
+    premiumAmount: lv === 15 ? 1 : lv % 4 === 0 ? 1 : lv % 2 === 0 ? premGold : premStars,
   };
 });
 
@@ -668,7 +695,7 @@ export const EGG_ITEM_META: Record<EggItemType, EggItemMeta> = {
     tier: 1,
     next: 'egg_2',
     desc: 'بيضة تنين بدائية. ادمج اثنتين للحصول على بيضة مدارية.',
-    cornValue: 20,
+    cornValue: 8,
   },
   egg_2: {
     id: 'egg_2',
@@ -676,7 +703,7 @@ export const EGG_ITEM_META: Record<EggItemType, EggItemMeta> = {
     tier: 2,
     next: 'egg_3',
     desc: 'بيضة بحرية لامعة. ادمجها لترقية عنصر التنين.',
-    cornValue: 45,
+    cornValue: 20,
   },
   egg_3: {
     id: 'egg_3',
@@ -684,7 +711,7 @@ export const EGG_ITEM_META: Record<EggItemType, EggItemMeta> = {
     tier: 3,
     next: 'egg_4',
     desc: 'بيضة السديم البنفسجية. اجمعها لقرابين المعبد.',
-    cornValue: 100,
+    cornValue: 45,
   },
   egg_4: {
     id: 'egg_4',
@@ -692,7 +719,7 @@ export const EGG_ITEM_META: Record<EggItemType, EggItemMeta> = {
     tier: 4,
     next: 'egg_5',
     desc: 'بيضة تنين الغابات المشتعلة.',
-    cornValue: 220,
+    cornValue: 95,
   },
   egg_5: {
     id: 'egg_5',
@@ -700,7 +727,7 @@ export const EGG_ITEM_META: Record<EggItemType, EggItemMeta> = {
     tier: 5,
     next: 'egg_6',
     desc: 'بيضة شمسية مشحونة بالطاقة الذهبية.',
-    cornValue: 480,
+    cornValue: 210,
   },
   egg_6: {
     id: 'egg_6',
@@ -708,7 +735,7 @@ export const EGG_ITEM_META: Record<EggItemType, EggItemMeta> = {
     tier: 6,
     next: 'egg_7',
     desc: 'بيضة الياقوت القرمزية النادرة.',
-    cornValue: 950,
+    cornValue: 420,
   },
   egg_7: {
     id: 'egg_7',
@@ -716,7 +743,7 @@ export const EGG_ITEM_META: Record<EggItemType, EggItemMeta> = {
     tier: 7,
     next: 'egg_love',
     desc: 'بيضة الكريستال السماوية المطلقة.',
-    cornValue: 2000,
+    cornValue: 880,
   },
   egg_love: {
     id: 'egg_love',
@@ -724,7 +751,7 @@ export const EGG_ITEM_META: Record<EggItemType, EggItemMeta> = {
     tier: 8,
     next: null,
     desc: 'أندر بيضة تنين! تمنح طاقة عالية ومكافآت نجوم عند التسليم.',
-    cornValue: 4500,
+    cornValue: 1400,
   },
   grapes: {
     id: 'grapes',
@@ -732,7 +759,7 @@ export const EGG_ITEM_META: Record<EggItemType, EggItemMeta> = {
     tier: 1,
     next: 'chalice',
     desc: 'مورد من صندوق الكنوز. ادمجها لصنع الكأس الإمبراطوري.',
-    cornValue: 60,
+    cornValue: 25,
   },
   chalice: {
     id: 'chalice',
@@ -740,7 +767,7 @@ export const EGG_ITEM_META: Record<EggItemType, EggItemMeta> = {
     tier: 2,
     next: 'cornucopia',
     desc: 'كأس مشتعل بالطاقة. ادمجه لصنع قرن الوفرة.',
-    cornValue: 180,
+    cornValue: 75,
   },
   cornucopia: {
     id: 'cornucopia',
@@ -748,7 +775,7 @@ export const EGG_ITEM_META: Record<EggItemType, EggItemMeta> = {
     tier: 3,
     next: 'feast',
     desc: 'قرن الوفرة المليء بجواهر التنانين.',
-    cornValue: 480,
+    cornValue: 210,
   },
   feast: {
     id: 'feast',
@@ -756,7 +783,7 @@ export const EGG_ITEM_META: Record<EggItemType, EggItemMeta> = {
     tier: 4,
     next: null,
     desc: 'أثمن قربان يطلبه حراس المعبد في البطولات!',
-    cornValue: 1200,
+    cornValue: 540,
   },
   chest: {
     id: 'chest',
@@ -764,7 +791,7 @@ export const EGG_ITEM_META: Record<EggItemType, EggItemMeta> = {
     tier: 0,
     next: null,
     desc: 'افتحه للحصول على جواهر التنين ومعززات الدمج.',
-    cornValue: 300,
+    cornValue: 130,
   },
 };
 
@@ -796,56 +823,30 @@ export const GOD_PATRONS: Record<GodPatronId, { name: string; title: string; col
 export function createInitialGrid(): GridCell[] {
   const lockedIndices = new Set([0, 7, 48, 55]);
   const presetItems: Partial<Record<number, EggItemType>> = {
-    1: 'egg_2',
+    1: 'egg_1',
     2: 'egg_1',
-    3: 'egg_3',
     4: 'egg_2',
-    5: 'egg_5',
-    6: 'egg_3',
-    8: 'egg_1',
-    9: 'egg_2',
+    5: 'egg_2',
+    9: 'egg_1',
     10: 'egg_3',
-    11: 'egg_1',
-    12: 'egg_4',
-    13: 'egg_2',
-    14: 'egg_6',
+    12: 'egg_2',
     15: 'egg_1',
-    16: 'egg_3',
-    17: 'egg_2',
-    18: 'egg_4',
-    19: 'egg_love',
-    20: 'egg_5',
-    21: 'chalice',
-    22: 'egg_2',
-    23: 'egg_3',
+    17: 'grapes',
+    18: 'egg_2',
+    20: 'egg_1',
+    22: 'egg_3',
     24: 'egg_1',
-    25: 'egg_4',
-    26: 'egg_3',
-    27: 'egg_5',
-    28: 'egg_3',
-    29: 'grapes',
-    30: 'egg_6',
-    31: 'egg_2',
+    26: 'grapes',
+    28: 'egg_2',
+    30: 'egg_1',
     32: 'egg_2',
-    33: 'egg_5',
-    34: 'egg_1',
-    35: 'egg_4',
-    36: 'cornucopia',
-    37: 'egg_3',
-    38: 'egg_4',
+    35: 'chalice',
+    37: 'egg_1',
     39: 'egg_2',
-    41: 'egg_3',
-    42: 'egg_5',
-    43: 'chalice',
-    44: 'egg_2',
-    45: 'egg_4',
-    46: 'chest',
-    49: 'egg_1',
-    50: 'egg_6',
-    51: 'egg_2',
-    52: 'egg_1',
-    53: 'egg_3',
-    54: 'egg_4',
+    42: 'egg_1',
+    44: 'egg_3',
+    50: 'egg_2',
+    53: 'egg_1',
   };
 
   return Array.from({ length: 56 }, (_, index) => ({
@@ -858,13 +859,13 @@ export function createInitialGrid(): GridCell[] {
 export function createRandomGodOrder(indexSeed = 0): GodOrder {
   const patrons: GodPatronId[] = ['anubis', 'horus', 'dionysus', 'bastet', 'zeus'];
   const wants: { item: EggItemType; reward: number; pts: number }[] = [
-    { item: 'egg_4', reward: 180, pts: 5 },
-    { item: 'egg_5', reward: 360, pts: 5 },
-    { item: 'egg_6', reward: 750, pts: 10 },
-    { item: 'chalice', reward: 280, pts: 5 },
-    { item: 'cornucopia', reward: 650, pts: 10 },
-    { item: 'feast', reward: 1400, pts: 15 },
-    { item: 'egg_love', reward: 2500, pts: 20 },
+    { item: 'egg_4', reward: 90, pts: 5 },
+    { item: 'egg_5', reward: 175, pts: 6 },
+    { item: 'egg_6', reward: 340, pts: 10 },
+    { item: 'chalice', reward: 130, pts: 5 },
+    { item: 'cornucopia', reward: 290, pts: 10 },
+    { item: 'feast', reward: 560, pts: 15 },
+    { item: 'egg_love', reward: 750, pts: 20 },
   ];
   const godId = patrons[(indexSeed + Math.floor(Math.random() * patrons.length)) % patrons.length];
   const pick = wants[Math.floor(Math.random() * wants.length)];
@@ -970,7 +971,7 @@ export function createInitialMarketListings(): MarketListing[] {
 }
 
 export function createInitialGameState(): GameState {
-  // 3 Open Default Slots occupied by 3 starter dragons (LVL 1..4) — DMD starts at 0 until LVL 5 + Custom_LVL >= 1!
+  // 3 Open Default Slots occupied by 3 starter dragons (LVL 1..3) — DMD starts strictly at 0!
   const starterDragons: Duck[] = [
     {
       id: 'dragon_aqua_1',
@@ -983,12 +984,13 @@ export function createInitialGameState(): GameState {
       dmd: 0,
       dmdStored: 0,
       slotIndex: 0,
-      feedCost: getFeedCost(1), // 15
+      feedCost: getFeedCost(1, 'RARE', 1),
       feedsProgress: 0,
       feedsRequired: 5,
       staked: false,
       stakeRatePerHour: 0,
       skillLevel: 1,
+      trainingLevel: 0,
       powerRating: 240,
       unlockedAt: Date.now() - 95000000,
     },
@@ -997,19 +999,20 @@ export function createInitialGameState(): GameState {
       name: 'تنين السديم الليلكي',
       skin: 'lilac',
       rarity: 'EPIC',
-      level: 3,
+      level: 2,
       maxLevel: 5,
       customLevel: 0,
       dmd: 0,
       dmdStored: 0,
       slotIndex: 1,
-      feedCost: getFeedCost(3), // 25
-      feedsProgress: 3,
-      feedsRequired: 9,
+      feedCost: getFeedCost(2, 'EPIC', 1),
+      feedsProgress: 2,
+      feedsRequired: 7,
       staked: false,
       stakeRatePerHour: 0,
-      skillLevel: 2,
-      powerRating: 380,
+      skillLevel: 1,
+      trainingLevel: 0,
+      powerRating: 350,
       unlockedAt: Date.now() - 90000000,
     },
     {
@@ -1017,19 +1020,20 @@ export function createInitialGameState(): GameState {
       name: 'تنين النار الذهبي',
       skin: 'classic',
       rarity: 'COMMON',
-      level: 4,
+      level: 3,
       maxLevel: 5,
       customLevel: 0,
       dmd: 0,
       dmdStored: 0,
       slotIndex: 2,
-      feedCost: getFeedCost(4), // 33
-      feedsProgress: 8,
-      feedsRequired: 12,
+      feedCost: getFeedCost(3, 'COMMON', 1),
+      feedsProgress: 4,
+      feedsRequired: 9,
       staked: false,
       stakeRatePerHour: 0,
       skillLevel: 2,
-      powerRating: 210,
+      trainingLevel: 0,
+      powerRating: 195,
       unlockedAt: Date.now() - 86400000,
     },
   ];
@@ -1039,8 +1043,8 @@ export function createInitialGameState(): GameState {
       id: 'god_harvest',
       godKey: 'harvest',
       name: 'بركة الحصاد',
-      subtitle: 'توفير 25% طاقة إطعام',
-      bonusDesc: 'يرد لك 25% من حبوب الطاقة عند إطعام التنانين تلقائياً.',
+      subtitle: 'توفير 20% طاقة إطعام',
+      bonusDesc: 'يخفض تكلفة الإطعام بنسبة 20% مع ضمان حرق صافي لا يقل عن 80% في كل نقرة.',
       goldCost: 40,
       starCost: 45,
       owned: false,
@@ -1086,7 +1090,7 @@ export function createInitialGameState(): GameState {
       id: 'fc_halloween',
       name: 'فصيلة الجحيم',
       collectionName: 'فصيلة الجحيم',
-      count: 3,
+      count: 2,
       totalSkins: 6,
       unlockedSkins: ['pumpkin'],
       possibleSkins: ['pumpkin', 'skeleton', 'ninja', 'cupid', 'cool', 'pharaoh'],
@@ -1095,7 +1099,7 @@ export function createInitialGameState(): GameState {
       id: 'fc_royal',
       name: 'التاج الإمبراطوري',
       collectionName: 'التاج الإمبراطوري',
-      count: 2,
+      count: 1,
       totalSkins: 5,
       unlockedSkins: ['lilac'],
       possibleSkins: ['lilac', 'royal', 'bride', 'pharaoh', 'classic'],
@@ -1104,7 +1108,7 @@ export function createInitialGameState(): GameState {
       id: 'fc_festival',
       name: 'تنانين العناصر',
       collectionName: 'تنانين العناصر',
-      count: 6,
+      count: 3,
       totalSkins: 6,
       unlockedSkins: ['aqua', 'dj', 'gamer'],
       possibleSkins: ['aqua', 'dj', 'gamer', 'cool', 'cupid', 'coffee'],
@@ -1113,7 +1117,7 @@ export function createInitialGameState(): GameState {
       id: 'fc_coffee',
       name: 'رماد البركان',
       collectionName: 'رماد البركان',
-      count: 2,
+      count: 1,
       totalSkins: 3,
       unlockedSkins: [],
       possibleSkins: ['coffee', 'classic', 'cool'],
@@ -1122,9 +1126,9 @@ export function createInitialGameState(): GameState {
 
   return {
     username: 'DRAGON_TAMER',
-    corn: 2400, // Balanced starting Energy for LVL 1..5 progression
-    stars: 35, // Enough to test Star Customization once reaching LVL 5 or save for Slot 4 (30 ★)
-    duckGold: 15,
+    corn: 480, // Calibrated starting Energy to keep progression tense & rewarding
+    stars: 12, // Calculated starting Stars
+    duckGold: 4,
     dmdTotal: 0, // Strictly 0 until a dragon reaches LVL 5 AND Custom_LVL >= 1!
     ducks: starterDragons,
     activeDuckIndex: 0,
@@ -1135,49 +1139,43 @@ export function createInitialGameState(): GameState {
       storeRevenueUsd: 210.0,
       adRevenueUsd: 39.0,
       adsWatchedToday: 0,
-      maxAdsPerDay: 5,
+      maxAdsPerDay: 4,
       totalPurchases: 0,
+      barterStarsToday: 0,
+      barterGoldToday: 0,
+      arenaFullWinsToday: 0,
+      energyEarnedToday: 0,
+      energyBurnedToday: 0,
+      starsEarnedToday: 0,
+      starsBurnedToday: 0,
     },
     weekendEventIndex: 0,
     grid: createInitialGrid(),
-    eggQueue: [
-      'egg_1',
-      'egg_2',
-      'egg_1',
-      'egg_3',
-      'egg_1',
-      'egg_2',
-      'grapes',
-      'egg_4',
-      'egg_2',
-      'egg_1',
-      'egg_3',
-      'chalice',
-    ],
+    eggQueue: ['egg_1', 'egg_2', 'egg_1', 'egg_3', 'egg_1', 'grapes'],
     godOrders: [
       {
         id: 'ord_init_1',
         godId: 'anubis',
         name: 'أنوبيس',
-        wantedItem: 'egg_5',
-        cornReward: 360,
+        wantedItem: 'egg_4',
+        cornReward: 95,
         trophyPoints: 5,
       },
       {
         id: 'ord_init_2',
         godId: 'horus',
         name: 'حورس',
-        wantedItem: 'egg_6',
-        cornReward: 750,
-        trophyPoints: 10,
+        wantedItem: 'egg_5',
+        cornReward: 180,
+        trophyPoints: 6,
       },
       {
         id: 'ord_init_3',
         godId: 'dionysus',
         name: 'ديونيسوس',
-        wantedItem: 'cornucopia',
-        cornReward: 650,
-        trophyPoints: 10,
+        wantedItem: 'chalice',
+        cornReward: 130,
+        trophyPoints: 5,
       },
     ],
     godCards,
@@ -1187,18 +1185,18 @@ export function createInitialGameState(): GameState {
         title: 'تسجيل الدخول اليومي لعالم التنانين',
         progress: 1,
         target: 1,
-        rewardStars: 6,
-        rewardEnergy: 300,
+        rewardStars: 2,
+        rewardEnergy: 80,
         claimed: false,
         actionLabel: 'استلام المكافأة',
       },
       {
         id: 'dt_feed',
         title: 'أطعم التنانين 25 مرة',
-        progress: 5,
+        progress: 0,
         target: 25,
-        rewardStars: 10,
-        rewardEnergy: 600,
+        rewardStars: 3,
+        rewardEnergy: 130,
         claimed: false,
         actionTab: 'DUCKS',
         actionLabel: 'إطعام',
@@ -1206,10 +1204,10 @@ export function createInitialGameState(): GameState {
       {
         id: 'dt_merge',
         title: 'ادمج 15 بيضة تنين',
-        progress: 3,
+        progress: 0,
         target: 15,
-        rewardStars: 12,
-        rewardEnergy: 800,
+        rewardStars: 3,
+        rewardEnergy: 160,
         claimed: false,
         actionTab: 'EGGS',
         actionLabel: 'إلى البيض',
@@ -1217,10 +1215,10 @@ export function createInitialGameState(): GameState {
       {
         id: 'dt_errands',
         title: 'سلّم 5 قرابين لحراس المعبد',
-        progress: 1,
+        progress: 0,
         target: 5,
-        rewardStars: 14,
-        rewardEnergy: 950,
+        rewardStars: 4,
+        rewardEnergy: 190,
         claimed: false,
         actionTab: 'EGGS',
         actionLabel: 'إلى المعبد',
@@ -1230,8 +1228,8 @@ export function createInitialGameState(): GameState {
         title: 'اربح 3 مواجهات في الحلبة',
         progress: 0,
         target: 3,
-        rewardStars: 18,
-        rewardEnergy: 1200,
+        rewardStars: 5,
+        rewardEnergy: 220,
         claimed: false,
         actionTab: 'ARENA',
         actionLabel: 'إلى الحلبة',
@@ -1258,6 +1256,12 @@ export function createInitialGameState(): GameState {
         { id: 'm1', sender: 'DRAGON_LEADER', text: 'مرحباً! طوروا تنانينكم للمستوى 5 وابدأوا تخصيص النجوم!', time: '14:20' },
         { id: 'm2', sender: 'FERMER_DRACO', text: 'الخانة 4 تفتح بعد وصول تنين واحد لـ LVL 5!', time: '14:22' },
       ],
+      talents: {
+        fury: 0,
+        carapace: 0,
+        incubation: 0,
+        prestige: 0,
+      },
     },
     wallet: {
       connected: false,
@@ -1265,19 +1269,19 @@ export function createInitialGameState(): GameState {
       gram: 0,
     },
     tournament: {
-      score: 12,
+      score: 0,
       claimedMilestones: [],
       resetSeconds: 5180,
     },
     league: {
-      points: 120,
-      wins: 2,
-      racesWon: 1,
-      winStreak: 1,
+      points: 100,
+      wins: 0,
+      racesWon: 0,
+      winStreak: 0,
       dailyClaimed: false,
     },
     battlePass: {
-      xp: 140,
+      xp: 0,
       premiumUnlocked: false,
       claimedFree: [],
       claimedPremium: [],
@@ -1289,17 +1293,22 @@ export function createInitialGameState(): GameState {
       totalTasksClaimed: 0,
       totalEggsHatched: 0,
       totalDucksMerged: 0,
-      hearts: 950,
-      medals: 120,
-      honorLetters: 18,
-      coinsOfChange: 2,
+      hearts: 300,
+      medals: 40,
+      honorLetters: 6,
+      coinsOfChange: 1,
       keys: 1,
       wheelSpins: 0,
       traderDeals: 0,
       dailyPassDay: 1,
       dailyPassClaimedToday: false,
-      autoMergeBoosters: 2,
+      autoMergeBoosters: 1,
       hammerBoosters: 1,
+    },
+    activeBuffs: {
+      duelFuryUntil: 0,
+      critEdgeUntil: 0,
+      eggSurgeUntil: 0,
     },
     autoMergeUnlocked: true,
     smartSellPrice: 1200,

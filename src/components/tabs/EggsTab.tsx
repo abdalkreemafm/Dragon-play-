@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Check, Flame, Hammer, Lock, Sparkles, Trophy, X, Zap } from 'lucide-react';
 import { EggItemType, GameState, GodOrder } from '../../types/game';
 import { EGG_ITEM_META, GOD_PATRONS } from '../../data/gameData';
+import { ECONOMY_LIMITS } from '../../utils/economyEngine';
 import { CornIcon, GodIllustration, ItemIcon } from '../art/DuckArt';
 import { TempleAltarBackdrop } from '../art/SceneBackdrops';
 import { soundFX } from '../../utils/sound';
@@ -41,6 +42,8 @@ export const EggsTab: React.FC<EggsTabProps> = ({
 
   const selectedItem = selectedCell !== null ? state.grid[selectedCell]?.item : null;
   const isBlitz = blitzSecLeft > 0;
+  const hasEggSurge = (state.activeBuffs?.eggSurgeUntil ?? 0) > Date.now();
+  const canAffordBlitz = state.corn >= ECONOMY_LIMITS.BLITZ_ACTIVATION_COST;
 
   const wantedByGodMap = new Map<EggItemType, GodOrder>();
   state.godOrders.forEach((ord) => {
@@ -148,22 +151,36 @@ export const EggsTab: React.FC<EggsTabProps> = ({
             </button>
 
             <button
+              disabled={!isBlitz && !canAffordBlitz}
               onClick={() => {
                 if (!isBlitz) {
+                  if (!canAffordBlitz) {
+                    soundFX.playError();
+                    return;
+                  }
                   soundFX.playBlitzStart();
                   onStartBlitz();
                 }
               }}
-              className={`px-2 py-1.5 rounded-xl text-[10px] font-black flex items-center justify-center gap-1 cursor-pointer ${
+              className={`min-h-[38px] px-2.5 py-1.5 rounded-xl text-[10px] font-black flex items-center justify-center gap-1 ${
                 isBlitz
-                  ? 'bg-rose-500 text-white animate-pulse'
-                  : 'bg-amber-400 text-slate-950 hover:brightness-105'
+                  ? 'bg-rose-500 text-white'
+                  : canAffordBlitz
+                    ? 'bg-amber-400 text-slate-950 hover:brightness-105 cursor-pointer'
+                    : 'bg-slate-800 text-slate-400 cursor-not-allowed'
               }`}
-              title="تفعيل موجة دمج سريعة لمدة 30 ثانية (2x نقاط)"
+              title={`تفعيل موجة دمج سريعة لمدة 30 ثانية (2× نقاط) مقابل ${ECONOMY_LIMITS.BLITZ_ACTIVATION_COST} طاقة`}
             >
               <Flame className="w-3.5 h-3.5" />
-              <span>{isBlitz ? `${Math.ceil(blitzSecLeft)}s 2×` : 'موجة 2×'}</span>
+              <span className="font-mono-num">
+                {isBlitz ? `${Math.ceil(blitzSecLeft)}s 2×` : `موجة 2× (${ECONOMY_LIMITS.BLITZ_ACTIVATION_COST}⚡)`}
+              </span>
             </button>
+            {hasEggSurge && (
+              <div className="px-2 py-1 rounded-lg bg-emerald-500/20 border border-emerald-400/40 text-emerald-300 text-[9px] font-black text-center font-mono-num">
+                إكسير التفقيس +20%
+              </div>
+            )}
           </div>
 
           {/* 3 Active Duck Gods */}

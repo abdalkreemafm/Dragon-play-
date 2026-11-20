@@ -14,6 +14,11 @@ import { DuckSkinId, GameState, MainTab } from '../../types/game';
 import { SKIN_CATALOG } from '../../data/gameData';
 import { CornIcon, DuckIllustration, StarIcon } from '../art/DuckArt';
 import { soundFX } from '../../utils/sound';
+import {
+  ECONOMY_LIMITS,
+  getInstantSummonStarCost,
+  getPlayerTier,
+} from '../../utils/economyEngine';
 
 interface TasksTabProps {
   state: GameState;
@@ -33,12 +38,12 @@ interface TasksTabProps {
 }
 
 const WHEEL_SEGMENTS = [
-  { label: '2,500 طاقة', color: '#16a34a', text: '#fff' },
+  { label: '420 طاقة', color: '#16a34a', text: '#fff' },
   { label: 'تنين RARE', color: '#2563eb', text: '#fff' },
-  { label: '20 نجمة ★', color: '#7c3aed', text: '#fff' },
-  { label: '150 ميدالية', color: '#0f172a', text: '#facc15' },
+  { label: '5 نجوم ★', color: '#7c3aed', text: '#fff' },
+  { label: '45 ميدالية', color: '#0f172a', text: '#facc15' },
   { label: 'تنين نادر', color: '#059669', text: '#fff' },
-  { label: '25 ذهب 💎', color: '#d97706', text: '#fff' },
+  { label: '5 ذهب 💎', color: '#d97706', text: '#fff' },
 ];
 
 export const TasksTab: React.FC<TasksTabProps> = ({
@@ -69,6 +74,10 @@ export const TasksTab: React.FC<TasksTabProps> = ({
   const [promoInput, setPromoInput] = useState('');
   const [promoFeedback, setPromoFeedback] = useState<string | null>(null);
   const [copiedInvite, setCopiedInvite] = useState(false);
+
+  const playerTier = getPlayerTier(state);
+  const summonUncommonCost = getInstantSummonStarCost('UNCOMMON', playerTier);
+  const summonRareCost = getInstantSummonStarCost('RARE', playerTier);
 
   const activeFlipPack = state.flipCoins.find((f) => f.id === activeFlipPackId) ?? null;
 
@@ -215,9 +224,9 @@ export const TasksTab: React.FC<TasksTabProps> = ({
             </p>
             <div className="grid grid-cols-3 gap-2">
               {[
-                { id: 'hr_free', label: 'حزمة مجانية', cost: 0, corn: 500, stars: 5 },
-                { id: 'hr_40', label: 'حزمة ذهبية', cost: 40, corn: 1500, stars: 15 },
-                { id: 'hr_80', label: 'حزمة أسطورية', cost: 80, corn: 3500, stars: 35 },
+                { id: 'hr_free', label: 'حزمة مجانية', cost: 0, corn: 120, stars: 2 },
+                { id: 'hr_40', label: 'حزمة ذهبية', cost: 40, corn: 320, stars: 4 },
+                { id: 'hr_80', label: 'حزمة أسطورية', cost: 80, corn: 680, stars: 8 },
               ].map((pack) => {
                 const claimed = state.claimedHonorPacks.includes(pack.id);
                 const canAfford = state.stats.honorLetters >= pack.cost;
@@ -278,7 +287,7 @@ export const TasksTab: React.FC<TasksTabProps> = ({
                   شاهد إعلان اختياري ({state.treasury.adsWatchedToday}/{state.treasury.maxAdsPerDay})
                 </h4>
                 <p className="text-xs text-emerald-400 font-mono-num font-bold mt-0.5">
-                  +350 طاقة فورية · دعم 50% لصندوق DMD
+                  +{ECONOMY_LIMITS.AD_ENERGY_REWARD} طاقة فورية · دعم 50% لصندوق DMD
                 </p>
               </div>
               <button
@@ -314,8 +323,8 @@ export const TasksTab: React.FC<TasksTabProps> = ({
             </p>
             <div className="grid grid-cols-3 gap-2">
               {[
-                { threshold: 2500, label: '+12 ★ نجوم', type: 'stars' as const },
-                { threshold: 5000, label: '+2,000 طاقة', type: 'corn' as const },
+                { threshold: 2500, label: '+4 ★ نجوم', type: 'stars' as const },
+                { threshold: 5000, label: '+380 طاقة', type: 'corn' as const },
                 { threshold: 8000, label: 'تنين جديد 🐉', type: 'duck' as const },
               ].map((m) => {
                 const reached = state.stats.hearts >= m.threshold;
@@ -355,7 +364,7 @@ export const TasksTab: React.FC<TasksTabProps> = ({
                 title: 'ادمج 10 بيضات تنين في ساحة البيض',
                 prog: state.stats.totalEggsHatched,
                 target: 10,
-                corn: 1800,
+                corn: 340,
                 stars: 0,
               },
               {
@@ -364,7 +373,7 @@ export const TasksTab: React.FC<TasksTabProps> = ({
                 prog: state.stats.totalDucksMerged,
                 target: 1,
                 corn: 0,
-                stars: 25,
+                stars: 8,
               },
               {
                 id: 'ach_stake_5',
@@ -372,7 +381,7 @@ export const TasksTab: React.FC<TasksTabProps> = ({
                 prog: state.ducks.filter((d) => d.customLevel >= 1 && d.level >= 5).length,
                 target: 2,
                 corn: 0,
-                stars: 60,
+                stars: 14,
               },
             ].map((ach) => {
               const done = ach.prog >= ach.target;
@@ -413,7 +422,10 @@ export const TasksTab: React.FC<TasksTabProps> = ({
           {/* INSTANT MERGE & PROMO CODE */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="bg-[#181b24] border border-slate-800 rounded-2xl p-4 space-y-2.5">
-              <h3 className="text-sm font-black text-white">استدعاء تنين فوري</h3>
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-black text-white">استدعاء تنين فوري</h3>
+                <span className="font-mono-num text-[10px] text-amber-300 font-bold">الرتبة {playerTier}</span>
+              </div>
               <div className="flex items-center justify-between text-xs">
                 <span className="text-emerald-400 font-bold">غير شائع مضمون</span>
                 <button
@@ -421,9 +433,9 @@ export const TasksTab: React.FC<TasksTabProps> = ({
                     soundFX.playGodConfirm();
                     onInstantMerge('UNCOMMON');
                   }}
-                  className="px-3 py-1.5 rounded-lg bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 font-bold hover:bg-emerald-500/30 cursor-pointer"
+                  className="min-h-[38px] px-3 py-1.5 rounded-lg bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 font-bold hover:bg-emerald-500/30 cursor-pointer font-mono-num"
                 >
-                  استدعاء (15 ★)
+                  استدعاء ({summonUncommonCost} ★)
                 </button>
               </div>
               <div className="flex items-center justify-between text-xs">
@@ -433,9 +445,9 @@ export const TasksTab: React.FC<TasksTabProps> = ({
                     soundFX.playGodConfirm();
                     onInstantMerge('RARE');
                   }}
-                  className="px-3 py-1.5 rounded-lg bg-sky-500/20 border border-sky-500/40 text-sky-300 font-bold hover:bg-sky-500/30 cursor-pointer"
+                  className="min-h-[38px] px-3 py-1.5 rounded-lg bg-sky-500/20 border border-sky-500/40 text-sky-300 font-bold hover:bg-sky-500/30 cursor-pointer font-mono-num"
                 >
-                  استدعاء (40 ★)
+                  استدعاء ({summonRareCost} ★)
                 </button>
               </div>
             </div>
@@ -480,13 +492,13 @@ export const TasksTab: React.FC<TasksTabProps> = ({
                 >
                   <div>
                     <div className="text-xs font-bold text-slate-200">{s.label}</div>
-                    <div className="text-[11px] text-emerald-400 font-mono-num">+500 طاقة</div>
+                    <div className="text-[11px] text-emerald-400 font-mono-num">+110 طاقة</div>
                   </div>
                   <button
                     disabled={claimed}
                     onClick={() => {
                       soundFX.playClaim();
-                      onClaimSocial(s.id, 500);
+                      onClaimSocial(s.id, 110);
                     }}
                     className={`px-3 py-1.5 rounded-lg text-xs font-bold ${
                       claimed
@@ -583,7 +595,7 @@ export const TasksTab: React.FC<TasksTabProps> = ({
                 }}
                 className="p-3 rounded-xl bg-slate-900 border border-slate-700 hover:border-emerald-400 text-center cursor-pointer transition-colors"
               >
-                <div className="text-emerald-400 font-mono-num font-black text-base">+400 ⚡</div>
+                <div className="text-emerald-400 font-mono-num font-black text-base">+120 ⚡</div>
                 <div className="text-[11px] text-slate-300 mt-0.5">دعوة صديق عادي</div>
               </button>
               <button
@@ -593,7 +605,7 @@ export const TasksTab: React.FC<TasksTabProps> = ({
                 }}
                 className="p-3 rounded-xl bg-slate-900 border border-slate-700 hover:border-amber-400 text-center cursor-pointer transition-colors"
               >
-                <div className="text-amber-400 font-mono-num font-black text-base">+1,500 ⚡ · +8 ★</div>
+                <div className="text-amber-400 font-mono-num font-black text-base">+320 ⚡ · +3 ★</div>
                 <div className="text-[11px] text-slate-300 mt-0.5">صديق باشتراك مميز</div>
               </button>
             </div>
