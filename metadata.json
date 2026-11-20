@@ -1,0 +1,8 @@
+{
+  "name": "DUCK × MY × DUCK",
+  "description": "لعبة تربية ودمج البط والبيض، جمع الآلهة، البطولات الإلهية، وسوق المزايدات.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
